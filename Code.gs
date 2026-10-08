@@ -320,7 +320,7 @@ function rowToObject_(headers, row) {
 
 function getCurrentUser_() {
   const email = Session.getActiveUser().getEmail();
-  const users = readRows_(SHEET_NAMES.users);
+  const users = readRowsSql_(SHEET_NAMES.users); // cut over to SQL Connect 2026-10-08 (Phase 4)
   const record = users.find(function (u) { return u.email === email; });
   return {
     email: email,
@@ -598,7 +598,7 @@ function sendSlackNotification_(subject, lines, emails) {
     Logger.log('Slack not configured (no SLACK_WEBHOOK_URL script property) — skipping.');
     return;
   }
-  const users = readRows_(SHEET_NAMES.users);
+  const users = readRowsSql_(SHEET_NAMES.users); // cut over to SQL Connect 2026-10-08 (Phase 4)
   const mentions = emails.map(function (email) {
     const user = users.find(function (u) { return u.email === email; });
     if (user && user.slackUserId) return '<@' + user.slackUserId + '>';
@@ -713,7 +713,7 @@ function doGet(e) {
     } else if (action === 'listVersions') {
       result = readRows_(SHEET_NAMES.versions);
     } else if (action === 'listUsers') {
-      result = readRows_(SHEET_NAMES.users);
+      result = readRowsSql_(SHEET_NAMES.users); // cut over to SQL Connect 2026-10-08 (Phase 4)
     } else if (action === 'listTeamRoster') {
       result = readRowsSql_(SHEET_NAMES.teamRoster); // cut over to SQL Connect 2026-10-08 (Phase 4)
     } else if (action === 'listAgencyHoldCo') {
@@ -974,7 +974,7 @@ function doPost(e) {
     requireWrite_(user);
     values.role = values.role || 'read';
     withLock_(function () {
-      appendRecord_(SHEET_NAMES.users, USER_FIELDS, values);
+      appendRecordSql_(SHEET_NAMES.users, USER_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'updateUser') {
     // payload: { originalEmail, email, name, role? } — role is optional so a
@@ -986,12 +986,12 @@ function doPost(e) {
     const patch = { email: values.email, name: values.name };
     if (values.role) patch.role = values.role;
     withLock_(function () {
-      updateRecord_(SHEET_NAMES.users, USER_FIELDS, 'email', values.originalEmail, patch);
+      updateRecordSql_(SHEET_NAMES.users, USER_FIELDS, 'email', values.originalEmail, patch); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'deleteUser') {
     requireWrite_(user);
     withLock_(function () {
-      deleteRowByKey_(SHEET_NAMES.users, USER_FIELDS, 'email', values.email);
+      deleteRowByKeySql_(SHEET_NAMES.users, USER_FIELDS, 'email', values.email); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'upsertClosedDeal') {
     // Mirrors Supabase's .upsert(row, {onConflict:'deal_id'}) semantics using
@@ -1227,7 +1227,18 @@ function measureCurrentDataSize() {
 // The service account key JSON lives in Script Properties (key
 // SQL_CONNECT_SERVICE_ACCOUNT_KEY), not in source -- it's a long-lived,
 // powerful credential and must never be committed to git.
+// Caches the access token (confirmed 2026-10-08) -- every call used to sign
+// a fresh JWT and do a full OAuth token exchange before the actual GraphQL
+// request, two serial network round-trips on every single SQL Connect call.
+// That's tolerable for occasional list-page loads, but becomes a real
+// latency/quota problem once a hot path like getCurrentUser_ (called on
+// every doGet/doPost) is cut over to SQL. The JWT itself is valid 3600s;
+// caching for 3000s (50 min) stays safely inside that window.
 function getServiceAccountAccessToken_() {
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get('sql_connect_access_token');
+  if (cached) return cached;
+
   const keyJson = PropertiesService.getScriptProperties().getProperty('SQL_CONNECT_SERVICE_ACCOUNT_KEY');
   if (!keyJson) {
     throw new Error('SQL_CONNECT_SERVICE_ACCOUNT_KEY script property is not set.');
@@ -1259,6 +1270,7 @@ function getServiceAccountAccessToken_() {
   if (!body.access_token) {
     throw new Error('Failed to get service account access token: ' + response.getContentText());
   }
+  cache.put('sql_connect_access_token', body.access_token, 3000);
   return body.access_token;
 }
 
@@ -2457,6 +2469,56 @@ function testPlacementCategoriesAndMenuItemsCutover() {
   check('Category gone via doGet(listPlacementCategories) after doPost(deletePlacementCategory)', cats.some(function (c) { return c.id === catId; }), false);
   items = JSON.parse(doGet({ parameter: { action: 'listPlacementMenuItems' } }).getContent());
   check('MenuItem bulk-deleted via doPost(deletePlacementCategory) cascade', items.some(function (m) { return m.id === itemId; }), false);
+
+  Logger.log(results.join('\n'));
+}
+
+function migrateUsersToSql() {
+  const existingSql = readRowsSql_(SHEET_NAMES.users);
+  const existingEmails = new Set(existingSql.map(function (u) { return u.email; }));
+  const sheetRows = readRows_(SHEET_NAMES.users);
+  let migrated = 0, skipped = 0;
+  sheetRows.forEach(function (row) {
+    if (existingEmails.has(row.email)) { skipped++; return; }
+    appendRecordSql_(SHEET_NAMES.users, USER_FIELDS, row);
+    existingEmails.add(row.email);
+    migrated++;
+  });
+  Logger.log('Users migration: migrated=' + migrated + ' skipped=' + skipped + ' (sheet had ' + sheetRows.length + ' total)');
+}
+
+// One-time manual check (confirmed 2026-10-08; run from the Apps Script
+// editor's Run button) -- Phase 4 cutover verification for Users. This is
+// the highest-stakes entity cut over so far: getCurrentUser_ (called on
+// every doGet/doPost) now reads from SQL, so if the real admin row wasn't
+// migrated first, every write action -- including this test's own
+// doPost calls -- would fail requireWrite_ with "Write access required".
+// Uses synthetic emails throughout and never touches the real signed-in
+// user's own row.
+function testUsersCutover() {
+  const results = [];
+  function check(label, actual, expected) {
+    const pass = JSON.stringify(actual) === JSON.stringify(expected);
+    results.push((pass ? 'PASS' : 'FAIL') + ' -- ' + label + (pass ? '' : (': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual))));
+  }
+
+  const whoami = JSON.parse(doGet({ parameter: { action: 'whoami' } }).getContent());
+  check('Real signed-in user still resolves with write role via doGet(whoami)', whoami.role, 'write');
+
+  const email = 'cutover-test-' + Utilities.getUuid() + '@example.com';
+  const name = 'Cutover Test User';
+
+  doPost({ parameter: { action: 'createUser', payload: JSON.stringify({ email: email, name: name, role: 'read', slackUserId: '' }) } });
+  let list = JSON.parse(doGet({ parameter: { action: 'listUsers' } }).getContent());
+  check('User appears via doGet(listUsers) after doPost(createUser)', list.some(function (u) { return u.email === email; }), true);
+
+  doPost({ parameter: { action: 'updateUser', payload: JSON.stringify({ originalEmail: email, email: email, name: name + ' Renamed', role: 'write' }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listUsers' } }).getContent());
+  check('User renamed+role updated via doPost(updateUser)', list.find(function (u) { return u.email === email; }).name + '|' + list.find(function (u) { return u.email === email; }).role, name + ' Renamed|write');
+
+  doPost({ parameter: { action: 'deleteUser', payload: JSON.stringify({ email: email }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listUsers' } }).getContent());
+  check('User gone via doGet(listUsers) after doPost(deleteUser)', list.some(function (u) { return u.email === email; }), false);
 
   Logger.log(results.join('\n'));
 }
