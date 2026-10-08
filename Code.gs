@@ -718,7 +718,7 @@ function doGet(e) {
     } else if (action === 'listPitchTeams') {
       result = readRowsSql_(SHEET_NAMES.pitchTeams); // cut over to SQL Connect 2026-10-08 (Phase 4)
     } else if (action === 'listClosedDeals') {
-      result = readRows_(SHEET_NAMES.closedDeals);
+      result = readRowsSql_(SHEET_NAMES.closedDeals); // cut over to SQL Connect 2026-10-08 (Phase 4)
     } else if (action === 'listTentpoleShows') {
       result = readRowsSql_(SHEET_NAMES.tentpoleShows); // cut over to SQL Connect 2026-10-08 (Phase 4)
     } else if (action === 'listSeasonYears') {
@@ -985,13 +985,14 @@ function doPost(e) {
     // known, otherwise append a new row.
     requireWrite_(user);
     withLock_(function () {
-      const updated = updateRecord_(SHEET_NAMES.closedDeals, CLOSED_DEAL_FIELDS, 'deal_id', values.deal_id, values);
-      if (!updated) appendRecord_(SHEET_NAMES.closedDeals, CLOSED_DEAL_FIELDS, values);
+      // cut over to SQL Connect 2026-10-08 (Phase 4)
+      const updated = updateRecordSql_(SHEET_NAMES.closedDeals, CLOSED_DEAL_FIELDS, 'deal_id', values.deal_id, values);
+      if (!updated) appendRecordSql_(SHEET_NAMES.closedDeals, CLOSED_DEAL_FIELDS, values);
     });
   } else if (action === 'deleteClosedDeal') {
     requireWrite_(user);
     withLock_(function () {
-      deleteRowByKey_(SHEET_NAMES.closedDeals, CLOSED_DEAL_FIELDS, 'deal_id', values.deal_id);
+      deleteRowByKeySql_(SHEET_NAMES.closedDeals, CLOSED_DEAL_FIELDS, 'deal_id', values.deal_id); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'createTentpoleShow') {
     requireWrite_(user);
@@ -1884,7 +1885,13 @@ function updateRecordSql_(sheetName, fields, idField, id, values) {
 function deleteRowByKeySql_(sheetName, fields, keyField, keyValue) {
   const entity = DC_ENTITY_[sheetName];
   const variables = {};
-  variables[keyField] = keyValue;
+  // ClosedDeal is the one entity with a fieldMap (snake_case Code.gs fields
+  // vs. camelCase GraphQL variables, e.g. deal_id -> dealId) -- confirmed
+  // 2026-10-08 this was missing here (every other DeleteX mutation's key
+  // variable happens to already be camelCase, so this went unnoticed until
+  // ClosedDeal's cutover).
+  const gqlKey = entity.fieldMap ? (entity.fieldMap[keyField] || keyField) : keyField;
+  variables[gqlKey] = keyValue;
   const data = executeDataConnect_(entity.deleteOp, variables);
   const rootField = entity.type + '_delete';
   return !!data[rootField];
@@ -2561,6 +2568,68 @@ function testProjectFileLinksCutover() {
   deleteProject_(projectId);
   list = JSON.parse(doGet({ parameter: { action: 'listProjectFileLinks', projectId: projectId } }).getContent());
   check('Remaining link bulk-deleted via deleteProject_ cascade', list.some(function (l) { return l.id === linkId; }), false);
+
+  Logger.log(results.join('\n'));
+}
+
+// Only these two are genuinely numeric (GraphQL Float) -- every other
+// CLOSED_DEAL_FIELDS column is a String, but Sheets stores anything
+// number-looking (e.g. a bare project_id like 1784050079976) as a JS
+// number, same root cause as SeasonYear's 'name' (confirmed 2026-10-08:
+// "$projectId is invalid String: unexpected value: ... with type: float64").
+const CLOSED_DEAL_NUMERIC_FIELDS_ = ['total_investment', 'total_margin_percent'];
+
+function migrateClosedDealsToSql() {
+  const existingSql = readRowsSql_(SHEET_NAMES.closedDeals);
+  const existingIds = new Set(existingSql.map(function (d) { return d.deal_id; }));
+  const sheetRows = readRows_(SHEET_NAMES.closedDeals);
+  let migrated = 0, skipped = 0;
+  sheetRows.forEach(function (row) {
+    if (existingIds.has(row.deal_id)) { skipped++; return; }
+    const coerced = {};
+    CLOSED_DEAL_FIELDS.forEach(function (f) {
+      const v = row[f];
+      coerced[f] = (typeof v === 'number' && !CLOSED_DEAL_NUMERIC_FIELDS_.includes(f)) ? String(v) : v;
+    });
+    appendRecordSql_(SHEET_NAMES.closedDeals, CLOSED_DEAL_FIELDS, coerced);
+    existingIds.add(row.deal_id);
+    migrated++;
+  });
+  Logger.log('ClosedDeals migration: migrated=' + migrated + ' skipped=' + skipped + ' (sheet had ' + sheetRows.length + ' total)');
+}
+
+// One-time manual check (confirmed 2026-10-08; run from the Apps Script
+// editor's Run button) -- Phase 4 cutover verification for ClosedDeals,
+// the last entity in this batch and the only one with a fieldMap (snake_case
+// Code.gs fields vs. camelCase GraphQL variables). Also caught and fixed a
+// real bug here: deleteRowByKeySql_ wasn't applying entity.fieldMap to the
+// key field, so DeleteClosedDeal would have been sent the wrong variable
+// name ('deal_id' instead of the required 'dealId'). Exercises upsertClosedDeal's
+// both branches (insert when not found, update in place when found) and
+// the 'snapshot' JSON_FIELDS blob round-tripping as a real object.
+function testClosedDealsCutover() {
+  const results = [];
+  function check(label, actual, expected) {
+    const pass = JSON.stringify(actual) === JSON.stringify(expected);
+    results.push((pass ? 'PASS' : 'FAIL') + ' -- ' + label + (pass ? '' : (': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual))));
+  }
+
+  const dealId = 'cutover-test-deal-' + Utilities.getUuid();
+  const snapshot = { lines: [{ label: 'Line 1' }] };
+
+  doPost({ parameter: { action: 'upsertClosedDeal', payload: JSON.stringify({ deal_id: dealId, project_name: 'Cutover Test Project', deal_status: 'closed', snapshot: snapshot }) } });
+  let list = JSON.parse(doGet({ parameter: { action: 'listClosedDeals' } }).getContent());
+  check('Deal appears via doGet(listClosedDeals) after doPost(upsertClosedDeal) insert branch', list.some(function (d) { return d.deal_id === dealId; }), true);
+  check('Deal snapshot round-trips as a real object', list.find(function (d) { return d.deal_id === dealId; }).snapshot, snapshot);
+
+  doPost({ parameter: { action: 'upsertClosedDeal', payload: JSON.stringify({ deal_id: dealId, project_name: 'Cutover Test Project Renamed', deal_status: 'closed', snapshot: snapshot }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listClosedDeals' } }).getContent());
+  check('Deal updated in place via doPost(upsertClosedDeal) update branch', list.find(function (d) { return d.deal_id === dealId; }).project_name, 'Cutover Test Project Renamed');
+  check('Still exactly one row for this deal_id (no duplicate insert)', list.filter(function (d) { return d.deal_id === dealId; }).length, 1);
+
+  doPost({ parameter: { action: 'deleteClosedDeal', payload: JSON.stringify({ deal_id: dealId }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listClosedDeals' } }).getContent());
+  check('Deal gone via doGet(listClosedDeals) after doPost(deleteClosedDeal)', list.some(function (d) { return d.deal_id === dealId; }), false);
 
   Logger.log(results.join('\n'));
 }
