@@ -6,7 +6,7 @@
 # version returned.
 
 query ListUsers @auth(level: NO_ACCESS) {
-  users {
+  users(limit: 10000) {
     email
     name
     role
@@ -15,7 +15,7 @@ query ListUsers @auth(level: NO_ACCESS) {
 }
 
 query ListTags @auth(level: NO_ACCESS) {
-  tags {
+  tags(limit: 10000) {
     id
     name
     color
@@ -25,40 +25,40 @@ query ListTags @auth(level: NO_ACCESS) {
 }
 
 query ListHoldCos @auth(level: NO_ACCESS) {
-  holdCos {
+  holdCos(limit: 10000) {
     name
   }
 }
 
 query ListPitchTeams @auth(level: NO_ACCESS) {
-  pitchTeams {
+  pitchTeams(limit: 10000) {
     name
   }
 }
 
 query ListAgencyHoldCo @auth(level: NO_ACCESS) {
-  agencyHoldCos {
+  agencyHoldCos(limit: 10000) {
     agency
     holdCo
   }
 }
 
 query ListTeamRoster @auth(level: NO_ACCESS) {
-  teamRosters {
+  teamRosters(limit: 10000) {
     teamMemberName
     pitchTeam
   }
 }
 
 query ListTentpoleShows @auth(level: NO_ACCESS) {
-  tentpoleShows {
+  tentpoleShows(limit: 10000) {
     id
     name
   }
 }
 
 query ListSeasonYears @auth(level: NO_ACCESS) {
-  seasonYears {
+  seasonYears(limit: 10000) {
     id
     showId
     name
@@ -66,7 +66,7 @@ query ListSeasonYears @auth(level: NO_ACCESS) {
 }
 
 query ListPlacementCategories @auth(level: NO_ACCESS) {
-  placementCategories {
+  placementCategories(limit: 10000) {
     id
     name
     placementType
@@ -74,7 +74,7 @@ query ListPlacementCategories @auth(level: NO_ACCESS) {
 }
 
 query ListPlacementMenuItems @auth(level: NO_ACCESS) {
-  placementMenuItems {
+  placementMenuItems(limit: 10000) {
     id
     categoryId
     name
@@ -86,7 +86,7 @@ query ListPlacementMenuItems @auth(level: NO_ACCESS) {
 }
 
 query ListProjects @auth(level: NO_ACCESS) {
-  projects {
+  projects(limit: 10000) {
     id
     projectName
     account
@@ -126,7 +126,7 @@ query ListProjects @auth(level: NO_ACCESS) {
 }
 
 query ListVersions @auth(level: NO_ACCESS) {
-  versions {
+  versions(limit: 10000) {
     id
     projectId
     name
@@ -143,7 +143,7 @@ query ListVersions @auth(level: NO_ACCESS) {
 }
 
 query ListSponsorshipPackages @auth(level: NO_ACCESS) {
-  sponsorshipPackages {
+  sponsorshipPackages(limit: 10000) {
     id
     showId
     seasonYearId
@@ -159,7 +159,7 @@ query ListSponsorshipPackages @auth(level: NO_ACCESS) {
 }
 
 query ListProjectFileLinks @auth(level: NO_ACCESS) {
-  projectFileLinks {
+  projectFileLinks(limit: 10000) {
     id
     projectId
     name
@@ -170,7 +170,7 @@ query ListProjectFileLinks @auth(level: NO_ACCESS) {
 }
 
 query ListClosedDeals @auth(level: NO_ACCESS) {
-  closedDeals {
+  closedDeals(limit: 10000) {
     dealId
     projectId
     versionId

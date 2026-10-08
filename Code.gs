@@ -465,12 +465,21 @@ function lookupValue_(sheetName, keyField, key, valueField) {
   return match ? match[valueField] : null;
 }
 
+// cut over to SQL Connect 2026-10-08 (Phase 4) — sibling of lookupValue_ for entities already on SQL.
+function lookupValueSql_(sheetName, keyField, key, valueField) {
+  if (!key) return null;
+  const rows = readRowsSql_(sheetName);
+  const match = rows.find(function (r) { return r[keyField] === key; });
+  return match ? match[valueField] : null;
+}
+
 function applyProjectLookups_(values) {
   if (values.pitchLeadName) {
     values.pitchTeam = lookupValue_(SHEET_NAMES.teamRoster, 'teamMemberName', values.pitchLeadName, 'pitchTeam');
   }
   if (values.agency) {
-    values.holdCo = lookupValue_(SHEET_NAMES.agencyHoldCo, 'agency', values.agency, 'holdCo');
+    // cut over to SQL Connect 2026-10-08 (Phase 4)
+    values.holdCo = lookupValueSql_(SHEET_NAMES.agencyHoldCo, 'agency', values.agency, 'holdCo');
   }
 }
 
@@ -707,7 +716,7 @@ function doGet(e) {
     } else if (action === 'listTeamRoster') {
       result = readRows_(SHEET_NAMES.teamRoster);
     } else if (action === 'listAgencyHoldCo') {
-      result = readRows_(SHEET_NAMES.agencyHoldCo);
+      result = readRowsSql_(SHEET_NAMES.agencyHoldCo); // cut over to SQL Connect 2026-10-08 (Phase 4)
     } else if (action === 'listHoldCos') {
       result = readRowsSql_(SHEET_NAMES.holdCos); // cut over to SQL Connect 2026-10-08 (Phase 4)
     } else if (action === 'listPitchTeams') {
@@ -890,7 +899,7 @@ function doPost(e) {
   } else if (action === 'createAgencyHoldCoEntry') {
     requireWrite_(user);
     withLock_(function () {
-      appendRecord_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, values);
+      appendRecordSql_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'updateTeamRosterEntry') {
     requireWrite_(user);
@@ -905,21 +914,23 @@ function doPost(e) {
   } else if (action === 'updateAgencyHoldCoEntry') {
     requireWrite_(user);
     withLock_(function () {
-      updateRecord_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, 'agency', values.agency, values);
+      updateRecordSql_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, 'agency', values.agency, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'renameAgency') {
     // payload: { originalName, name } — originalName locates the row, name
     // is the new agency text, cascaded into every Project that referenced
-    // the old name (same pattern as updateHoldCo below).
+    // the old name (same pattern as updateHoldCo below). Projects isn't cut
+    // over yet, so that cascade deliberately stays on the Sheets-backed
+    // cascadeForeignKey_ -- its real data still lives there.
     requireWrite_(user);
     withLock_(function () {
-      updateRecord_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, 'agency', values.originalName, { agency: values.name });
+      updateRecordSql_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, 'agency', values.originalName, { agency: values.name }); // cut over to SQL Connect 2026-10-08 (Phase 4)
       cascadeForeignKey_(SHEET_NAMES.projects, PROJECT_FIELDS, 'agency', values.originalName, values.name);
     });
   } else if (action === 'deleteAgencyHoldCoEntry') {
     requireWrite_(user);
     withLock_(function () {
-      deleteRowByKey_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, 'agency', values.agency);
+      deleteRowByKeySql_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, 'agency', values.agency); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'createHoldCo') {
     requireWrite_(user);
@@ -929,19 +940,17 @@ function doPost(e) {
   } else if (action === 'updateHoldCo') {
     // payload: { originalName, name } — originalName locates the row,
     // name is the (possibly unchanged) new value, cascaded into every
-    // AgencyHoldCo row that referenced the old name. AgencyHoldCo isn't
-    // cut over yet, so that cascade deliberately stays on the Sheets-
-    // backed cascadeForeignKey_ -- its real data still lives there.
+    // AgencyHoldCo row that referenced the old name.
     requireWrite_(user);
     withLock_(function () {
       updateRecordSql_(SHEET_NAMES.holdCos, HOLDCO_FIELDS, 'name', values.originalName, { name: values.name }); // cut over to SQL Connect 2026-10-08 (Phase 4)
-      cascadeForeignKey_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, 'holdCo', values.originalName, values.name);
+      cascadeForeignKeySql_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, 'holdCo', values.originalName, values.name); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'deleteHoldCo') {
     requireWrite_(user);
     withLock_(function () {
       deleteRowByKeySql_(SHEET_NAMES.holdCos, HOLDCO_FIELDS, 'name', values.name); // cut over to SQL Connect 2026-10-08 (Phase 4)
-      cascadeForeignKey_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, 'holdCo', values.name, '');
+      cascadeForeignKeySql_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, 'holdCo', values.name, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'createPitchTeam') {
     requireWrite_(user);
@@ -1312,7 +1321,7 @@ const DATA_CONNECT_URL_ = 'https://firebasedataconnect.googleapis.com/v1/project
 const DATA_CONNECT_OPERATIONS_ = `
 
 query ListUsers {
-  users {
+  users(limit: 10000) {
     email
     name
     role
@@ -1321,7 +1330,7 @@ query ListUsers {
 }
 
 query ListTags {
-  tags {
+  tags(limit: 10000) {
     id
     name
     color
@@ -1331,40 +1340,40 @@ query ListTags {
 }
 
 query ListHoldCos {
-  holdCos {
+  holdCos(limit: 10000) {
     name
   }
 }
 
 query ListPitchTeams {
-  pitchTeams {
+  pitchTeams(limit: 10000) {
     name
   }
 }
 
 query ListAgencyHoldCo {
-  agencyHoldCos {
+  agencyHoldCos(limit: 10000) {
     agency
     holdCo
   }
 }
 
 query ListTeamRoster {
-  teamRosters {
+  teamRosters(limit: 10000) {
     teamMemberName
     pitchTeam
   }
 }
 
 query ListTentpoleShows {
-  tentpoleShows {
+  tentpoleShows(limit: 10000) {
     id
     name
   }
 }
 
 query ListSeasonYears {
-  seasonYears {
+  seasonYears(limit: 10000) {
     id
     showId
     name
@@ -1372,7 +1381,7 @@ query ListSeasonYears {
 }
 
 query ListPlacementCategories {
-  placementCategories {
+  placementCategories(limit: 10000) {
     id
     name
     placementType
@@ -1380,7 +1389,7 @@ query ListPlacementCategories {
 }
 
 query ListPlacementMenuItems {
-  placementMenuItems {
+  placementMenuItems(limit: 10000) {
     id
     categoryId
     name
@@ -1392,7 +1401,7 @@ query ListPlacementMenuItems {
 }
 
 query ListProjects {
-  projects {
+  projects(limit: 10000) {
     id
     projectName
     account
@@ -1432,7 +1441,7 @@ query ListProjects {
 }
 
 query ListVersions {
-  versions {
+  versions(limit: 10000) {
     id
     projectId
     name
@@ -1449,7 +1458,7 @@ query ListVersions {
 }
 
 query ListSponsorshipPackages {
-  sponsorshipPackages {
+  sponsorshipPackages(limit: 10000) {
     id
     showId
     seasonYearId
@@ -1465,7 +1474,7 @@ query ListSponsorshipPackages {
 }
 
 query ListProjectFileLinks {
-  projectFileLinks {
+  projectFileLinks(limit: 10000) {
     id
     projectId
     name
@@ -1476,7 +1485,7 @@ query ListProjectFileLinks {
 }
 
 query ListClosedDeals {
-  closedDeals {
+  closedDeals(limit: 10000) {
     dealId
     projectId
     versionId
@@ -2184,4 +2193,79 @@ function testTentpoleShowsCutover() {
   check('Show gone via doGet(listTentpoleShows) after doPost(deleteTentpoleShow)', list.some(function (s) { return s.id === id; }), false);
 
   Logger.log(results.join('\n'));
+}
+
+function migrateAgencyHoldCoToSql() {
+  const existingSql = readRowsSql_(SHEET_NAMES.agencyHoldCo);
+  const existingAgencies = new Set(existingSql.map(function (a) { return a.agency; }));
+  const sheetRows = readRows_(SHEET_NAMES.agencyHoldCo);
+  let migrated = 0, skipped = 0;
+  // The sheet itself never enforced uniqueness on `agency` the way Postgres's
+  // primary key does, so this also guards against duplicate rows *within*
+  // the sheet, not just rows already migrated in a prior run -- adding to
+  // the Set as we go (not just computing it once upfront) is what catches that.
+  sheetRows.forEach(function (row) {
+    if (existingAgencies.has(row.agency)) { skipped++; return; }
+    appendRecordSql_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, row);
+    existingAgencies.add(row.agency);
+    migrated++;
+  });
+  Logger.log('AgencyHoldCo migration: migrated=' + migrated + ' skipped=' + skipped + ' (sheet had ' + sheetRows.length + ' total)');
+}
+
+// One-time manual check (confirmed 2026-10-08; run from the Apps Script
+// editor's Run button) -- Phase 4 cutover verification for AgencyHoldCo,
+// same pattern as testHoldCosCutover. Also exercises the holdCo-rename
+// cascade (now SQL-backed via cascadeForeignKeySql_ in updateHoldCo) to
+// confirm AgencyHoldCo rows referencing a renamed HoldCo get updated too.
+function testAgencyHoldCoCutover() {
+  const results = [];
+  function check(label, actual, expected) {
+    const pass = JSON.stringify(actual) === JSON.stringify(expected);
+    results.push((pass ? 'PASS' : 'FAIL') + ' -- ' + label + (pass ? '' : (': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual))));
+  }
+
+  const agency = 'Cutover Test Agency ' + Utilities.getUuid();
+  const renamed = agency + ' Renamed';
+  const holdCoName = 'Cutover Test HoldCo ' + Utilities.getUuid();
+  const holdCoRenamed = holdCoName + ' Renamed';
+
+  doPost({ parameter: { action: 'createAgencyHoldCoEntry', payload: JSON.stringify({ agency: agency, holdCo: '' }) } });
+  let list = JSON.parse(doGet({ parameter: { action: 'listAgencyHoldCo' } }).getContent());
+  check('Agency appears via doGet(listAgencyHoldCo) after doPost(createAgencyHoldCoEntry)', list.some(function (a) { return a.agency === agency; }), true);
+
+  doPost({ parameter: { action: 'updateAgencyHoldCoEntry', payload: JSON.stringify({ agency: agency, holdCo: 'TEST HOLDCO' } ) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listAgencyHoldCo' } }).getContent());
+  check('Agency holdCo updated via doPost(updateAgencyHoldCoEntry)', list.find(function (a) { return a.agency === agency; }).holdCo, 'TEST HOLDCO');
+
+  doPost({ parameter: { action: 'renameAgency', payload: JSON.stringify({ originalName: agency, name: renamed }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listAgencyHoldCo' } }).getContent());
+  check('Agency renamed via doPost(renameAgency)', list.some(function (a) { return a.agency === renamed; }) && !list.some(function (a) { return a.agency === agency; }), true);
+
+  doPost({ parameter: { action: 'createHoldCo', payload: JSON.stringify({ name: holdCoName } ) } });
+  doPost({ parameter: { action: 'updateAgencyHoldCoEntry', payload: JSON.stringify({ agency: renamed, holdCo: holdCoName }) } });
+  doPost({ parameter: { action: 'updateHoldCo', payload: JSON.stringify({ originalName: holdCoName, name: holdCoRenamed }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listAgencyHoldCo' } }).getContent());
+  check('Agency holdCo cascaded via doPost(updateHoldCo) rename', list.find(function (a) { return a.agency === renamed; }).holdCo, holdCoRenamed);
+
+  doPost({ parameter: { action: 'deleteHoldCo', payload: JSON.stringify({ name: holdCoRenamed } ) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listAgencyHoldCo' } }).getContent());
+  check('Agency holdCo cleared via doPost(deleteHoldCo) cascade', list.find(function (a) { return a.agency === renamed; }).holdCo, '');
+
+  doPost({ parameter: { action: 'deleteAgencyHoldCoEntry', payload: JSON.stringify({ agency: renamed }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listAgencyHoldCo' } }).getContent());
+  check('Agency gone via doGet(listAgencyHoldCo) after doPost(deleteAgencyHoldCoEntry)', list.some(function (a) { return a.agency === renamed; }), false);
+
+  Logger.log(results.join('\n'));
+}
+
+// Diagnostic for the 2026-10-08 AgencyHoldCo cutover test failure -- checks
+// whether ListAgencyHoldCo's generated query is silently capping row count
+// (the table now has ~1069 rows post-migration, unlike every other entity
+// cut over so far, which had under 10 -- a default page-size limit on the
+// generated list resolver would explain a freshly-inserted row not showing
+// up in doGet(listAgencyHoldCo)'s results).
+function diagnoseAgencyHoldCoListSize() {
+  const rows = readRowsSql_(SHEET_NAMES.agencyHoldCo);
+  Logger.log('readRowsSql_(agencyHoldCo) returned ' + rows.length + ' rows');
 }
