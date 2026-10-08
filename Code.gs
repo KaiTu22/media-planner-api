@@ -731,9 +731,9 @@ function doGet(e) {
     } else if (action === 'listSponsorshipPackages') {
       result = readRows_(SHEET_NAMES.sponsorshipPackages);
     } else if (action === 'listPlacementCategories') {
-      result = readRows_(SHEET_NAMES.placementCategories);
+      result = readRowsSql_(SHEET_NAMES.placementCategories); // cut over to SQL Connect 2026-10-08 (Phase 4)
     } else if (action === 'listPlacementMenuItems') {
-      result = readRows_(SHEET_NAMES.placementMenuItems);
+      result = readRowsSql_(SHEET_NAMES.placementMenuItems); // cut over to SQL Connect 2026-10-08 (Phase 4)
     } else if (action === 'whoami') {
       result = getCurrentUser_();
     } else {
@@ -1095,12 +1095,12 @@ function doPost(e) {
     requireWrite_(user);
     values.id = values.id || Utilities.getUuid();
     withLock_(function () {
-      appendRecord_(SHEET_NAMES.placementCategories, PLACEMENT_CATEGORY_FIELDS, values);
+      appendRecordSql_(SHEET_NAMES.placementCategories, PLACEMENT_CATEGORY_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'updatePlacementCategory') {
     requireWrite_(user);
     withLock_(function () {
-      updateRecord_(SHEET_NAMES.placementCategories, PLACEMENT_CATEGORY_FIELDS, 'id', values.id, values);
+      updateRecordSql_(SHEET_NAMES.placementCategories, PLACEMENT_CATEGORY_FIELDS, 'id', values.id, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'deletePlacementCategory') {
     // Menu items are genuine children of a category (same reasoning as
@@ -1108,24 +1108,24 @@ function doPost(e) {
     // menu item with no category has nowhere to appear in the picker.
     requireWrite_(user);
     withLock_(function () {
-      deleteRowsByForeignKey_(SHEET_NAMES.placementMenuItems, PLACEMENT_MENU_ITEM_FIELDS, 'categoryId', values.id);
-      deleteRowByKey_(SHEET_NAMES.placementCategories, PLACEMENT_CATEGORY_FIELDS, 'id', values.id);
+      deleteRowsByForeignKeySql_(SHEET_NAMES.placementMenuItems, PLACEMENT_MENU_ITEM_FIELDS, 'categoryId', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
+      deleteRowByKeySql_(SHEET_NAMES.placementCategories, PLACEMENT_CATEGORY_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'createPlacementMenuItem') {
     requireWrite_(user);
     values.id = values.id || Utilities.getUuid();
     withLock_(function () {
-      appendRecord_(SHEET_NAMES.placementMenuItems, PLACEMENT_MENU_ITEM_FIELDS, values);
+      appendRecordSql_(SHEET_NAMES.placementMenuItems, PLACEMENT_MENU_ITEM_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'updatePlacementMenuItem') {
     requireWrite_(user);
     withLock_(function () {
-      updateRecord_(SHEET_NAMES.placementMenuItems, PLACEMENT_MENU_ITEM_FIELDS, 'id', values.id, values);
+      updateRecordSql_(SHEET_NAMES.placementMenuItems, PLACEMENT_MENU_ITEM_FIELDS, 'id', values.id, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'deletePlacementMenuItem') {
     requireWrite_(user);
     withLock_(function () {
-      deleteRowByKey_(SHEET_NAMES.placementMenuItems, PLACEMENT_MENU_ITEM_FIELDS, 'id', values.id);
+      deleteRowByKeySql_(SHEET_NAMES.placementMenuItems, PLACEMENT_MENU_ITEM_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   }
 
@@ -2382,6 +2382,81 @@ function testSeasonYearsCutover() {
   doPost({ parameter: { action: 'deleteTentpoleShow', payload: JSON.stringify({ id: showId }) } });
   list = JSON.parse(doGet({ parameter: { action: 'listSeasonYears' } }).getContent());
   check('Child SeasonYear bulk-deleted via doPost(deleteTentpoleShow) cascade', list.some(function (s) { return s.id === childId; }), false);
+
+  Logger.log(results.join('\n'));
+}
+
+function migratePlacementCategoriesToSql() {
+  const existingSql = readRowsSql_(SHEET_NAMES.placementCategories);
+  const existingIds = new Set(existingSql.map(function (c) { return c.id; }));
+  const sheetRows = readRows_(SHEET_NAMES.placementCategories);
+  let migrated = 0, skipped = 0;
+  sheetRows.forEach(function (row) {
+    if (existingIds.has(row.id)) { skipped++; return; }
+    appendRecordSql_(SHEET_NAMES.placementCategories, PLACEMENT_CATEGORY_FIELDS, row);
+    existingIds.add(row.id);
+    migrated++;
+  });
+  Logger.log('PlacementCategories migration: migrated=' + migrated + ' skipped=' + skipped + ' (sheet had ' + sheetRows.length + ' total)');
+}
+
+function migratePlacementMenuItemsToSql() {
+  const existingSql = readRowsSql_(SHEET_NAMES.placementMenuItems);
+  const existingIds = new Set(existingSql.map(function (m) { return m.id; }));
+  const sheetRows = readRows_(SHEET_NAMES.placementMenuItems);
+  let migrated = 0, skipped = 0;
+  sheetRows.forEach(function (row) {
+    if (existingIds.has(row.id)) { skipped++; return; }
+    appendRecordSql_(SHEET_NAMES.placementMenuItems, PLACEMENT_MENU_ITEM_FIELDS, row);
+    existingIds.add(row.id);
+    migrated++;
+  });
+  Logger.log('PlacementMenuItems migration: migrated=' + migrated + ' skipped=' + skipped + ' (sheet had ' + sheetRows.length + ' total)');
+}
+
+// One-time manual check (confirmed 2026-10-08; run from the Apps Script
+// editor's Run button) -- Phase 4 cutover verification for
+// PlacementCategories + PlacementMenuItems together, since they share a
+// cascade (deletePlacementCategory bulk-deletes its child menu items,
+// now SQL-backed via deleteRowsByForeignKeySql_). Also exercises the
+// 'lines' JSON_FIELDS blob round-tripping as a real array, same pattern
+// as Version's 'packages' in testSqlStorageLayer.
+function testPlacementCategoriesAndMenuItemsCutover() {
+  const results = [];
+  function check(label, actual, expected) {
+    const pass = JSON.stringify(actual) === JSON.stringify(expected);
+    results.push((pass ? 'PASS' : 'FAIL') + ' -- ' + label + (pass ? '' : (': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual))));
+  }
+
+  const catId = Utilities.getUuid();
+  const catName = 'Cutover Test Category ' + catId;
+
+  doPost({ parameter: { action: 'createPlacementCategory', payload: JSON.stringify({ id: catId, name: catName, placementType: 'digital' }) } });
+  let cats = JSON.parse(doGet({ parameter: { action: 'listPlacementCategories' } }).getContent());
+  check('Category appears via doGet(listPlacementCategories) after doPost(createPlacementCategory)', cats.some(function (c) { return c.id === catId; }), true);
+
+  doPost({ parameter: { action: 'updatePlacementCategory', payload: JSON.stringify({ id: catId, name: catName + ' Renamed', placementType: 'digital' }) } });
+  cats = JSON.parse(doGet({ parameter: { action: 'listPlacementCategories' } }).getContent());
+  check('Category renamed via doPost(updatePlacementCategory)', cats.find(function (c) { return c.id === catId; }).name, catName + ' Renamed');
+
+  const itemId = Utilities.getUuid();
+  const itemName = 'Cutover Test MenuItem ' + itemId;
+  const lines = [{ label: 'Line 1', rate: 100 }];
+
+  doPost({ parameter: { action: 'createPlacementMenuItem', payload: JSON.stringify({ id: itemId, categoryId: catId, name: itemName, rateMode: 'flat', lines: lines }) } });
+  let items = JSON.parse(doGet({ parameter: { action: 'listPlacementMenuItems' } }).getContent());
+  check('MenuItem appears via doGet(listPlacementMenuItems) after doPost(createPlacementMenuItem)', items.some(function (m) { return m.id === itemId; }), true);
+  check('MenuItem lines round-trips as a real array', items.find(function (m) { return m.id === itemId; }).lines, lines);
+
+  doPost({ parameter: { action: 'updatePlacementMenuItem', payload: JSON.stringify({ id: itemId, name: itemName + ' Renamed' }) } });
+  items = JSON.parse(doGet({ parameter: { action: 'listPlacementMenuItems' } }).getContent());
+  check('MenuItem renamed via doPost(updatePlacementMenuItem)', items.find(function (m) { return m.id === itemId; }).name, itemName + ' Renamed');
+
+  doPost({ parameter: { action: 'deletePlacementCategory', payload: JSON.stringify({ id: catId }) } });
+  cats = JSON.parse(doGet({ parameter: { action: 'listPlacementCategories' } }).getContent());
+  check('Category gone via doGet(listPlacementCategories) after doPost(deletePlacementCategory)', cats.some(function (c) { return c.id === catId; }), false);
+  items = JSON.parse(doGet({ parameter: { action: 'listPlacementMenuItems' } }).getContent());
+  check('MenuItem bulk-deleted via doPost(deletePlacementCategory) cascade', items.some(function (m) { return m.id === itemId; }), false);
 
   Logger.log(results.join('\n'));
 }
