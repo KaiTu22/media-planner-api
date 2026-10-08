@@ -727,7 +727,7 @@ function doGet(e) {
     } else if (action === 'listTentpoleShows') {
       result = readRowsSql_(SHEET_NAMES.tentpoleShows); // cut over to SQL Connect 2026-10-08 (Phase 4)
     } else if (action === 'listSeasonYears') {
-      result = readRows_(SHEET_NAMES.seasonYears);
+      result = readRowsSql_(SHEET_NAMES.seasonYears); // cut over to SQL Connect 2026-10-08 (Phase 4)
     } else if (action === 'listSponsorshipPackages') {
       result = readRows_(SHEET_NAMES.sponsorshipPackages);
     } else if (action === 'listPlacementCategories') {
@@ -1028,13 +1028,13 @@ function doPost(e) {
     // a Show (not just a soft reference the way Project's is), so those
     // rows are deleted outright rather than orphaned — and any project
     // pointing at one of them has its seasonYearId cleared the same way
-    // tentpoleShowId is below. SeasonYears/Projects/SponsorshipPackages
-    // aren't cut over yet, so all of this stays on the Sheets-backed
-    // helpers deliberately -- only the TentpoleShows row itself (just
-    // below) moves to SQL Connect.
+    // tentpoleShowId is below. Projects/SponsorshipPackages aren't cut
+    // over yet, so their cascades stay on the Sheets-backed helpers
+    // deliberately -- only the TentpoleShows row and the SeasonYears
+    // bulk-delete below move to SQL Connect.
     requireWrite_(user);
     withLock_(function () {
-      const deletedSeasonYearIds = deleteRowsByForeignKey_(SHEET_NAMES.seasonYears, SEASON_YEAR_FIELDS, 'showId', values.id);
+      const deletedSeasonYearIds = deleteRowsByForeignKeySql_(SHEET_NAMES.seasonYears, SEASON_YEAR_FIELDS, 'showId', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
       deletedSeasonYearIds.forEach(function (seasonYearId) {
         cascadeForeignKey_(SHEET_NAMES.projects, PROJECT_FIELDS, 'seasonYearId', seasonYearId, '');
         cascadeForeignKey_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'seasonYearId', seasonYearId, '');
@@ -1050,20 +1050,21 @@ function doPost(e) {
     requireWrite_(user);
     values.id = values.id || Utilities.getUuid();
     withLock_(function () {
-      appendRecord_(SHEET_NAMES.seasonYears, SEASON_YEAR_FIELDS, values);
+      appendRecordSql_(SHEET_NAMES.seasonYears, SEASON_YEAR_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'updateSeasonYear') {
     requireWrite_(user);
     withLock_(function () {
-      updateRecord_(SHEET_NAMES.seasonYears, SEASON_YEAR_FIELDS, 'id', values.id, values);
+      updateRecordSql_(SHEET_NAMES.seasonYears, SEASON_YEAR_FIELDS, 'id', values.id, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'deleteSeasonYear') {
     // Projects and Sponsorship Hub packages referencing this season/year
     // keep it cleared, not deleted — same non-destructive cascade as
-    // tentpoleShowId.
+    // tentpoleShowId. Projects/SponsorshipPackages aren't cut over yet, so
+    // those cascades stay on the Sheets-backed helpers deliberately.
     requireWrite_(user);
     withLock_(function () {
-      deleteRowByKey_(SHEET_NAMES.seasonYears, SEASON_YEAR_FIELDS, 'id', values.id);
+      deleteRowByKeySql_(SHEET_NAMES.seasonYears, SEASON_YEAR_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
       cascadeForeignKey_(SHEET_NAMES.projects, PROJECT_FIELDS, 'seasonYearId', values.id, '');
       cascadeForeignKey_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'seasonYearId', values.id, '');
     });
@@ -2320,6 +2321,67 @@ function testTeamRosterCutover() {
   doPost({ parameter: { action: 'deleteTeamRosterEntry', payload: JSON.stringify({ teamMemberName: memberName }) } });
   list = JSON.parse(doGet({ parameter: { action: 'listTeamRoster' } }).getContent());
   check('Member gone via doGet(listTeamRoster) after doPost(deleteTeamRosterEntry)', list.some(function (r) { return r.teamMemberName === memberName; }), false);
+
+  Logger.log(results.join('\n'));
+}
+
+function migrateSeasonYearsToSql() {
+  const existingSql = readRowsSql_(SHEET_NAMES.seasonYears);
+  const existingIds = new Set(existingSql.map(function (s) { return s.id; }));
+  const sheetRows = readRows_(SHEET_NAMES.seasonYears);
+  let migrated = 0, skipped = 0;
+  sheetRows.forEach(function (row) {
+    if (existingIds.has(row.id)) { skipped++; return; }
+    // Sheets stores season-year names like "2026" as a Number cell, not
+    // text, so getValues() hands back a JS number here -- GraphQL's String
+    // type rejects that outright (confirmed 2026-10-08: "$name is invalid
+    // String: unexpected value: 2026 with type: float64"), so coerce it.
+    appendRecordSql_(SHEET_NAMES.seasonYears, SEASON_YEAR_FIELDS, Object.assign({}, row, { name: String(row.name) }));
+    existingIds.add(row.id);
+    migrated++;
+  });
+  Logger.log('SeasonYears migration: migrated=' + migrated + ' skipped=' + skipped + ' (sheet had ' + sheetRows.length + ' total)');
+}
+
+// One-time manual check (confirmed 2026-10-08; run from the Apps Script
+// editor's Run button) -- Phase 4 cutover verification for SeasonYears.
+// Also exercises deleteTentpoleShow's bulk-delete cascade into
+// SeasonYears (now SQL-backed via deleteRowsByForeignKeySql_) to confirm
+// a Show's child SeasonYears rows are actually removed when the Show is
+// deleted.
+function testSeasonYearsCutover() {
+  const results = [];
+  function check(label, actual, expected) {
+    const pass = JSON.stringify(actual) === JSON.stringify(expected);
+    results.push((pass ? 'PASS' : 'FAIL') + ' -- ' + label + (pass ? '' : (': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual))));
+  }
+
+  const id = Utilities.getUuid();
+  const name = 'Cutover Test SeasonYear ' + id;
+
+  doPost({ parameter: { action: 'createSeasonYear', payload: JSON.stringify({ id: id, showId: '', name: name }) } });
+  let list = JSON.parse(doGet({ parameter: { action: 'listSeasonYears' } }).getContent());
+  check('SeasonYear appears via doGet(listSeasonYears) after doPost(createSeasonYear)', list.some(function (s) { return s.id === id; }), true);
+
+  doPost({ parameter: { action: 'updateSeasonYear', payload: JSON.stringify({ id: id, name: name + ' Renamed' }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listSeasonYears' } }).getContent());
+  check('SeasonYear renamed via doPost(updateSeasonYear)', list.find(function (s) { return s.id === id; }).name, name + ' Renamed');
+
+  doPost({ parameter: { action: 'deleteSeasonYear', payload: JSON.stringify({ id: id }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listSeasonYears' } }).getContent());
+  check('SeasonYear gone via doGet(listSeasonYears) after doPost(deleteSeasonYear)', list.some(function (s) { return s.id === id; }), false);
+
+  const showId = Utilities.getUuid();
+  const showName = 'Cutover Test Show ' + showId;
+  const childId = Utilities.getUuid();
+  doPost({ parameter: { action: 'createTentpoleShow', payload: JSON.stringify({ id: showId, name: showName }) } });
+  doPost({ parameter: { action: 'createSeasonYear', payload: JSON.stringify({ id: childId, showId: showId, name: 'Child Season' }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listSeasonYears' } }).getContent());
+  check('Child SeasonYear appears before Show deletion', list.some(function (s) { return s.id === childId; }), true);
+
+  doPost({ parameter: { action: 'deleteTentpoleShow', payload: JSON.stringify({ id: showId }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listSeasonYears' } }).getContent());
+  check('Child SeasonYear bulk-deleted via doPost(deleteTentpoleShow) cascade', list.some(function (s) { return s.id === childId; }), false);
 
   Logger.log(results.join('\n'));
 }
