@@ -511,7 +511,7 @@ function getOrCreateYearFolder_(parent, year) {
 // through to Drive and finding the folder themselves. Content arrives
 // base64-encoded (safe for a form POST body, unlike raw binary).
 function uploadProjectAttachment_(projectId, filename, mimeType, contentBase64) {
-  const project = readRows_(SHEET_NAMES.projects).find(function (p) { return p.id === projectId; });
+  const project = readRowsSql_(SHEET_NAMES.projects).find(function (p) { return p.id === projectId; }); // cut over to SQL Connect 2026-10-08 (Phase 4)
   if (!project || !project.folderId) {
     throw new Error('Project has no Drive folder to upload to.');
   }
@@ -522,7 +522,7 @@ function uploadProjectAttachment_(projectId, filename, mimeType, contentBase64) 
 }
 
 function listProjectFiles_(projectId) {
-  const project = readRows_(SHEET_NAMES.projects).find(function (p) { return p.id === projectId; });
+  const project = readRowsSql_(SHEET_NAMES.projects).find(function (p) { return p.id === projectId; }); // cut over to SQL Connect 2026-10-08 (Phase 4)
   if (!project || !project.folderId) return [];
   const folder = DriveApp.getFolderById(project.folderId);
   const files = folder.getFiles();
@@ -541,7 +541,7 @@ function listProjectFiles_(projectId) {
 // since this now fires automatically on every debounced sync, not on a
 // deliberate user click.
 function uploadProjectFile_(projectId, content) {
-  const project = readRows_(SHEET_NAMES.projects).find(function (p) { return p.id === projectId; });
+  const project = readRowsSql_(SHEET_NAMES.projects).find(function (p) { return p.id === projectId; }); // cut over to SQL Connect 2026-10-08 (Phase 4)
   if (!project || !project.folderId) return; // no Drive folder yet (e.g. legacy/imported project) — skip
   const sanitizedName = (project.projectName || 'untitled').replace(/[^a-z0-9]/gi, '_').toLowerCase();
   const filename = 'INTERNAL_' + sanitizedName + '.json';
@@ -634,6 +634,8 @@ function createTag_(values) {
 // uploaded is a much bigger, harder-to-reverse action than removing a sheet
 // row, and isn't what "delete this project" was asked for.
 function deleteProject_(projectId) {
+  // cut over to SQL Connect 2026-10-08 (Phase 4) -- Versions isn't cut over
+  // yet, so its raw Sheets loop stays as-is deliberately.
   const versionsSheet = getSheet_(SHEET_NAMES.versions);
   const vHeaders = ensureColumns_(versionsSheet, VERSION_FIELDS);
   const vProjectIdx = vHeaders.indexOf('projectId');
@@ -644,21 +646,8 @@ function deleteProject_(projectId) {
     }
   }
 
-  // cut over to SQL Connect 2026-10-08 (Phase 4) -- ProjectFileLinks itself
-  // is cut over now; Projects isn't, so the raw Sheets loop above (Versions)
-  // and below (the Project row itself) stay as-is deliberately.
   deleteRowsByForeignKeySql_(SHEET_NAMES.projectFileLinks, PROJECT_FILE_LINK_FIELDS, 'projectId', projectId);
-
-  const sheet = getSheet_(SHEET_NAMES.projects);
-  const headers = ensureColumns_(sheet, PROJECT_FIELDS);
-  const idIdx = headers.indexOf('id');
-  const data = sheet.getDataRange().getValues();
-  for (let r = data.length - 1; r >= 1; r--) {
-    if (data[r][idIdx] === projectId) {
-      sheet.deleteRow(r + 1);
-      break;
-    }
-  }
+  deleteRowByKeySql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'id', projectId); // cut over to SQL Connect 2026-10-08 (Phase 4)
 }
 
 // Removes a tag from the managed list and strips it from every project
@@ -666,19 +655,19 @@ function deleteProject_(projectId) {
 // longer exists in the vocabulary. Caller must hold the script lock (see
 // withLock_ in doPost) since this mutates two sheets.
 function deleteTag_(tagId) {
-  // Cut over to SQL Connect 2026-10-08 (Phase 4, Tags first) -- but only
-  // the Tags-specific calls. The Projects reads/writes below stay on
-  // Sheets deliberately: Projects isn't cut over yet, so that's still
-  // where its real data lives.
+  // cut over to SQL Connect 2026-10-08 (Phase 4) -- this is a per-row
+  // conditional string edit (strip one value out of a comma-separated
+  // list), not a blanket field replace, so it doesn't fit the generic
+  // bulk cascadeForeignKeySql_ pattern and stays a manual loop.
   const tags = readRowsSql_(SHEET_NAMES.tags);
   const tag = tags.find(function (t) { return t.id === tagId; });
   if (!tag) return;
 
-  readRows_(SHEET_NAMES.projects).forEach(function (p) {
+  readRowsSql_(SHEET_NAMES.projects).forEach(function (p) {
     const projectTags = (p.tags || '').split(',').map(function (t) { return t.trim(); }).filter(Boolean);
     if (projectTags.includes(tag.name)) {
       const remaining = projectTags.filter(function (t) { return t !== tag.name; }).join(',');
-      updateRecord_(SHEET_NAMES.projects, PROJECT_FIELDS, 'id', p.id, { id: p.id, tags: remaining });
+      updateRecordSql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'id', p.id, { id: p.id, tags: remaining });
     }
   });
 
@@ -704,7 +693,7 @@ function doGet(e) {
     } else if (action === 'listTags') {
       result = readRowsSql_(SHEET_NAMES.tags); // cut over to SQL Connect 2026-10-08 (Phase 4, Tags first)
     } else if (action === 'listProjects') {
-      result = readRows_(SHEET_NAMES.projects);
+      result = readRowsSql_(SHEET_NAMES.projects); // cut over to SQL Connect 2026-10-08 (Phase 4)
     } else if (action === 'listVersions') {
       result = readRows_(SHEET_NAMES.versions);
     } else if (action === 'listUsers') {
@@ -841,7 +830,7 @@ function doPost(e) {
     applyProjectLookups_(values); // reads TeamRoster/AgencyHoldCo — different sheets, no lock needed
     createProjectFolder_(values); // Drive API call — slow, no shared-sheet state, no lock needed
     withLock_(function () {
-      appendRecord_(SHEET_NAMES.projects, PROJECT_FIELDS, values);
+      appendRecordSql_(SHEET_NAMES.projects, PROJECT_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
     try {
       sendAssignmentNotifications_(values);
@@ -854,7 +843,7 @@ function doPost(e) {
     values.updatedBy = user.email;
     applyProjectLookups_(values);
     withLock_(function () {
-      updateRecord_(SHEET_NAMES.projects, PROJECT_FIELDS, 'id', values.id, values);
+      updateRecordSql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'id', values.id, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'createVersion') {
     requireWrite_(user);
@@ -906,13 +895,11 @@ function doPost(e) {
   } else if (action === 'renameAgency') {
     // payload: { originalName, name } — originalName locates the row, name
     // is the new agency text, cascaded into every Project that referenced
-    // the old name (same pattern as updateHoldCo below). Projects isn't cut
-    // over yet, so that cascade deliberately stays on the Sheets-backed
-    // cascadeForeignKey_ -- its real data still lives there.
+    // the old name (same pattern as updateHoldCo below).
     requireWrite_(user);
     withLock_(function () {
       updateRecordSql_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, 'agency', values.originalName, { agency: values.name }); // cut over to SQL Connect 2026-10-08 (Phase 4)
-      cascadeForeignKey_(SHEET_NAMES.projects, PROJECT_FIELDS, 'agency', values.originalName, values.name);
+      cascadeForeignKeySql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'agency', values.originalName, values.name); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'deleteAgencyHoldCoEntry') {
     requireWrite_(user);
@@ -1015,19 +1002,17 @@ function doPost(e) {
     // a Show (not just a soft reference the way Project's is), so those
     // rows are deleted outright rather than orphaned — and any project
     // pointing at one of them has its seasonYearId cleared the same way
-    // tentpoleShowId is below. Projects/SponsorshipPackages aren't cut
-    // over yet, so their cascades stay on the Sheets-backed helpers
-    // deliberately -- only the TentpoleShows row and the SeasonYears
-    // bulk-delete below move to SQL Connect.
+    // tentpoleShowId is below. SponsorshipPackages isn't cut over yet, so
+    // its cascades stay on the Sheets-backed helpers deliberately.
     requireWrite_(user);
     withLock_(function () {
       const deletedSeasonYearIds = deleteRowsByForeignKeySql_(SHEET_NAMES.seasonYears, SEASON_YEAR_FIELDS, 'showId', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
       deletedSeasonYearIds.forEach(function (seasonYearId) {
-        cascadeForeignKey_(SHEET_NAMES.projects, PROJECT_FIELDS, 'seasonYearId', seasonYearId, '');
+        cascadeForeignKeySql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'seasonYearId', seasonYearId, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
         cascadeForeignKey_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'seasonYearId', seasonYearId, '');
       });
       deleteRowByKeySql_(SHEET_NAMES.tentpoleShows, TENTPOLE_SHOW_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
-      cascadeForeignKey_(SHEET_NAMES.projects, PROJECT_FIELDS, 'tentpoleShowId', values.id, '');
+      cascadeForeignKeySql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'tentpoleShowId', values.id, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
       // Sponsorship Hub packages are real built inventory, not a soft
       // reference — orphan (clear showId), never cascade-delete the
       // package itself just because its Show went away.
@@ -1047,12 +1032,12 @@ function doPost(e) {
   } else if (action === 'deleteSeasonYear') {
     // Projects and Sponsorship Hub packages referencing this season/year
     // keep it cleared, not deleted — same non-destructive cascade as
-    // tentpoleShowId. Projects/SponsorshipPackages aren't cut over yet, so
-    // those cascades stay on the Sheets-backed helpers deliberately.
+    // tentpoleShowId. SponsorshipPackages isn't cut over yet, so that
+    // cascade stays on the Sheets-backed helper deliberately.
     requireWrite_(user);
     withLock_(function () {
       deleteRowByKeySql_(SHEET_NAMES.seasonYears, SEASON_YEAR_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
-      cascadeForeignKey_(SHEET_NAMES.projects, PROJECT_FIELDS, 'seasonYearId', values.id, '');
+      cascadeForeignKeySql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'seasonYearId', values.id, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
       cascadeForeignKey_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'seasonYearId', values.id, '');
     });
   } else if (action === 'createSponsorshipPackage') {
@@ -2630,6 +2615,117 @@ function testClosedDealsCutover() {
   doPost({ parameter: { action: 'deleteClosedDeal', payload: JSON.stringify({ deal_id: dealId }) } });
   list = JSON.parse(doGet({ parameter: { action: 'listClosedDeals' } }).getContent());
   check('Deal gone via doGet(listClosedDeals) after doPost(deleteClosedDeal)', list.some(function (d) { return d.deal_id === dealId; }), false);
+
+  Logger.log(results.join('\n'));
+}
+
+// rushRequest is a GraphQL Boolean, but Sheets checkbox-less cells can hold
+// almost anything ("", "Yes", "FALSE", a real boolean) -- coerce defensively
+// rather than wait for a live error like the SeasonYear/ClosedDeal numeric
+// coercion bugs. Every other PROJECT_FIELDS column is a String (or a Date/
+// Timestamp that's already proven to round-trip as an ISO string elsewhere).
+function coerceProjectRowForSql_(row) {
+  const out = Object.assign({}, row);
+  const v = out.rushRequest;
+  out.rushRequest = (typeof v === 'boolean') ? v : (typeof v === 'string' ? /^(true|yes)$/i.test(v.trim()) : !!v);
+  return out;
+}
+
+function migrateProjectsToSql() {
+  const existingSql = readRowsSql_(SHEET_NAMES.projects);
+  const existingIds = new Set(existingSql.map(function (p) { return p.id; }));
+  const sheetRows = readRows_(SHEET_NAMES.projects);
+  let migrated = 0, skipped = 0;
+  sheetRows.forEach(function (row) {
+    if (existingIds.has(row.id)) { skipped++; return; }
+    appendRecordSql_(SHEET_NAMES.projects, PROJECT_FIELDS, coerceProjectRowForSql_(row));
+    existingIds.add(row.id);
+    migrated++;
+  });
+  Logger.log('Projects migration: migrated=' + migrated + ' skipped=' + skipped + ' (sheet had ' + sheetRows.length + ' total)');
+}
+
+// One-time manual check (confirmed 2026-10-08; run from the Apps Script
+// editor's Run button) -- Phase 4 cutover verification for Projects, the
+// first of the high-stakes final batch. Two groups of checks:
+//
+// 1. Storage-layer checks (list/update/delete, plus every cascade INTO
+//    Projects: deleteTag_, renameAgency, deleteTentpoleShow,
+//    deleteSeasonYear) using a project row seeded directly via
+//    appendRecordSql_ -- bypassing the real createProject business logic
+//    (applyProjectLookups_, createProjectFolder_) since those aren't part
+//    of this migration and createProjectFolder_ has a real side effect
+//    (creates an actual Drive folder).
+// 2. One single real doPost({action:'createProject'}) call, to confirm the
+//    full live path (lookups + Drive folder creation + SQL write) still
+//    works end to end -- then deleteProject_ removes the DB rows
+//    immediately after, but per deleteProject_'s own design it deliberately
+//    does NOT delete the real Drive folder it just created. That folder
+//    (named "Debug - Debug - ZZZ_DELETE_ME Cutover Test Project", inside
+//    the current year's subfolder of the shared project-folders Drive) is
+//    harmless but real -- feel free to delete it manually afterward.
+function testProjectsCutover() {
+  const results = [];
+  function check(label, actual, expected) {
+    const pass = JSON.stringify(actual) === JSON.stringify(expected);
+    results.push((pass ? 'PASS' : 'FAIL') + ' -- ' + label + (pass ? '' : (': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual))));
+  }
+
+  const projectId = 'cutover-test-project-' + Utilities.getUuid();
+  appendRecordSql_(SHEET_NAMES.projects, PROJECT_FIELDS, { id: projectId, projectName: 'Cutover Test Project', agency: 'Cutover Test Agency Untouched', tags: 'Alpha,Beta' });
+  let list = JSON.parse(doGet({ parameter: { action: 'listProjects' } }).getContent());
+  check('Project appears via doGet(listProjects) after appendRecordSql_', list.some(function (p) { return p.id === projectId; }), true);
+
+  doPost({ parameter: { action: 'updateProject', payload: JSON.stringify({ id: projectId, projectName: 'Cutover Test Project Renamed' }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listProjects' } }).getContent());
+  check('Project renamed via doPost(updateProject)', list.find(function (p) { return p.id === projectId; }).projectName, 'Cutover Test Project Renamed');
+
+  // deleteTag_'s cascade -- strips one tag out of the comma-separated list.
+  const tagId = Utilities.getUuid();
+  const tagName = 'Cutover Test Tag ' + tagId;
+  appendRecordSql_(SHEET_NAMES.tags, TAG_FIELDS, { id: tagId, name: tagName, color: '#000000' });
+  updateRecordSql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'id', projectId, { id: projectId, tags: 'Alpha,' + tagName + ',Beta' });
+  deleteTag_(tagId);
+  list = JSON.parse(doGet({ parameter: { action: 'listProjects' } }).getContent());
+  check('Project tags cascaded via deleteTag_ (tag stripped, others kept)', list.find(function (p) { return p.id === projectId; }).tags, 'Alpha,Beta');
+
+  // renameAgency's cascade -- blanket field replace via cascadeForeignKeySql_.
+  const agency = 'Cutover Test Agency ' + Utilities.getUuid();
+  const agencyRenamed = agency + ' Renamed';
+  updateRecordSql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'id', projectId, { id: projectId, agency: agency });
+  doPost({ parameter: { action: 'createAgencyHoldCoEntry', payload: JSON.stringify({ agency: agency, holdCo: '' }) } });
+  doPost({ parameter: { action: 'renameAgency', payload: JSON.stringify({ originalName: agency, name: agencyRenamed }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listProjects' } }).getContent());
+  check('Project agency cascaded via doPost(renameAgency)', list.find(function (p) { return p.id === projectId; }).agency, agencyRenamed);
+  doPost({ parameter: { action: 'deleteAgencyHoldCoEntry', payload: JSON.stringify({ agency: agencyRenamed }) } });
+
+  // deleteTentpoleShow's and deleteSeasonYear's cascades -- field cleared to ''.
+  const showId = Utilities.getUuid();
+  const seasonYearId = Utilities.getUuid();
+  doPost({ parameter: { action: 'createTentpoleShow', payload: JSON.stringify({ id: showId, name: 'Cutover Test Show ' + showId }) } });
+  updateRecordSql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'id', projectId, { id: projectId, tentpoleShowId: showId });
+  doPost({ parameter: { action: 'deleteTentpoleShow', payload: JSON.stringify({ id: showId }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listProjects' } }).getContent());
+  check('Project tentpoleShowId cleared via doPost(deleteTentpoleShow)', list.find(function (p) { return p.id === projectId; }).tentpoleShowId, '');
+
+  doPost({ parameter: { action: 'createSeasonYear', payload: JSON.stringify({ id: seasonYearId, showId: '', name: 'Cutover Test Season' }) } });
+  updateRecordSql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'id', projectId, { id: projectId, seasonYearId: seasonYearId });
+  doPost({ parameter: { action: 'deleteSeasonYear', payload: JSON.stringify({ id: seasonYearId }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listProjects' } }).getContent());
+  check('Project seasonYearId cleared via doPost(deleteSeasonYear)', list.find(function (p) { return p.id === projectId; }).seasonYearId, '');
+
+  deleteProject_(projectId);
+  list = JSON.parse(doGet({ parameter: { action: 'listProjects' } }).getContent());
+  check('Project gone via doGet(listProjects) after deleteProject_', list.some(function (p) { return p.id === projectId; }), false);
+
+  // Real end-to-end check of the actual createProject action -- see this
+  // function's header comment re: the real Drive folder this leaves behind.
+  const liveProjectId = Utilities.getUuid();
+  doPost({ parameter: { action: 'createProject', payload: JSON.stringify({ id: liveProjectId, account: 'Debug', brand: 'Debug', projectName: 'ZZZ_DELETE_ME Cutover Test Project' }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listProjects' } }).getContent());
+  const liveProject = list.find(function (p) { return p.id === liveProjectId; });
+  check('Real createProject action writes to SQL and gets a Drive folder', !!(liveProject && liveProject.folderId), true);
+  deleteProject_(liveProjectId);
 
   Logger.log(results.join('\n'));
 }
