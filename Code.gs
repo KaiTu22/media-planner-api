@@ -703,7 +703,7 @@ function doGet(e) {
     } else if (action === 'listSeasonYears') {
       result = readRowsSql_(SHEET_NAMES.seasonYears); // cut over to SQL Connect 2026-10-08 (Phase 4)
     } else if (action === 'listSponsorshipPackages') {
-      result = readRows_(SHEET_NAMES.sponsorshipPackages);
+      result = readRowsSql_(SHEET_NAMES.sponsorshipPackages); // cut over to SQL Connect 2026-10-08 (Phase 4)
     } else if (action === 'listPlacementCategories') {
       result = readRowsSql_(SHEET_NAMES.placementCategories); // cut over to SQL Connect 2026-10-08 (Phase 4)
     } else if (action === 'listPlacementMenuItems') {
@@ -992,21 +992,20 @@ function doPost(e) {
     // a Show (not just a soft reference the way Project's is), so those
     // rows are deleted outright rather than orphaned — and any project
     // pointing at one of them has its seasonYearId cleared the same way
-    // tentpoleShowId is below. SponsorshipPackages isn't cut over yet, so
-    // its cascades stay on the Sheets-backed helpers deliberately.
+    // tentpoleShowId is below.
     requireWrite_(user);
     withLock_(function () {
       const deletedSeasonYearIds = deleteRowsByForeignKeySql_(SHEET_NAMES.seasonYears, SEASON_YEAR_FIELDS, 'showId', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
       deletedSeasonYearIds.forEach(function (seasonYearId) {
         cascadeForeignKeySql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'seasonYearId', seasonYearId, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
-        cascadeForeignKey_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'seasonYearId', seasonYearId, '');
+        cascadeForeignKeySql_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'seasonYearId', seasonYearId, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
       });
       deleteRowByKeySql_(SHEET_NAMES.tentpoleShows, TENTPOLE_SHOW_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
       cascadeForeignKeySql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'tentpoleShowId', values.id, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
       // Sponsorship Hub packages are real built inventory, not a soft
       // reference — orphan (clear showId), never cascade-delete the
       // package itself just because its Show went away.
-      cascadeForeignKey_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'showId', values.id, '');
+      cascadeForeignKeySql_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'showId', values.id, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'createSeasonYear') {
     requireWrite_(user);
@@ -1022,13 +1021,12 @@ function doPost(e) {
   } else if (action === 'deleteSeasonYear') {
     // Projects and Sponsorship Hub packages referencing this season/year
     // keep it cleared, not deleted — same non-destructive cascade as
-    // tentpoleShowId. SponsorshipPackages isn't cut over yet, so that
-    // cascade stays on the Sheets-backed helper deliberately.
+    // tentpoleShowId.
     requireWrite_(user);
     withLock_(function () {
       deleteRowByKeySql_(SHEET_NAMES.seasonYears, SEASON_YEAR_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
       cascadeForeignKeySql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'seasonYearId', values.id, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
-      cascadeForeignKey_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'seasonYearId', values.id, '');
+      cascadeForeignKeySql_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'seasonYearId', values.id, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'createSponsorshipPackage') {
     requireWrite_(user);
@@ -1039,19 +1037,19 @@ function doPost(e) {
     values.updatedAt = now;
     values.updatedBy = user.email;
     withLock_(function () {
-      appendRecord_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, values);
+      appendRecordSql_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'updateSponsorshipPackage') {
     requireWrite_(user);
     values.updatedAt = now;
     values.updatedBy = user.email;
     withLock_(function () {
-      updateRecord_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'id', values.id, values);
+      updateRecordSql_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'id', values.id, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'deleteSponsorshipPackage') {
     requireWrite_(user);
     withLock_(function () {
-      deleteRowByKey_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'id', values.id);
+      deleteRowByKeySql_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'createPlacementCategory') {
     requireWrite_(user);
@@ -2773,6 +2771,76 @@ function testVersionsCutover() {
   deleteProject_(projectId);
   list = JSON.parse(doGet({ parameter: { action: 'listVersions' } }).getContent());
   check('Remaining version bulk-deleted via deleteProject_ cascade', list.some(function (v) { return v.id === versionId; }), false);
+
+  Logger.log(results.join('\n'));
+}
+
+function migrateSponsorshipPackagesToSql() {
+  const existingSql = readRowsSql_(SHEET_NAMES.sponsorshipPackages);
+  const existingIds = new Set(existingSql.map(function (p) { return p.id; }));
+  const sheetRows = readRows_(SHEET_NAMES.sponsorshipPackages);
+  let migrated = 0, skipped = 0;
+  sheetRows.forEach(function (row) {
+    if (existingIds.has(row.id)) { skipped++; return; }
+    appendRecordSql_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, row);
+    existingIds.add(row.id);
+    migrated++;
+  });
+  Logger.log('SponsorshipPackages migration: migrated=' + migrated + ' skipped=' + skipped + ' (sheet had ' + sheetRows.length + ' total)');
+}
+
+// One-time manual check (confirmed 2026-10-08; run from the Apps Script
+// editor's Run button) -- Phase 4 cutover verification for
+// SponsorshipPackages, the last entity in the entire migration. Exercises
+// its own CRUD, both bulk-update cascades INTO it (from deleteTentpoleShow
+// via showId and seasonYearId, and from deleteSeasonYear via seasonYearId),
+// and 'placements'/'blendGroups' JSON_FIELDS blobs round-tripping as real
+// arrays.
+function testSponsorshipPackagesCutover() {
+  const results = [];
+  function check(label, actual, expected) {
+    const pass = JSON.stringify(actual) === JSON.stringify(expected);
+    results.push((pass ? 'PASS' : 'FAIL') + ' -- ' + label + (pass ? '' : (': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual))));
+  }
+
+  const pkgId = Utilities.getUuid();
+  const placements = [{ title: 'Test Placement', investment: 500 }];
+  const blendGroups = [{ label: 'Test Blend', items: [] }];
+
+  doPost({ parameter: { action: 'createSponsorshipPackage', payload: JSON.stringify({ id: pkgId, name: 'Cutover Test Package', placements: placements, blendGroups: blendGroups }) } });
+  let list = JSON.parse(doGet({ parameter: { action: 'listSponsorshipPackages' } }).getContent());
+  check('Package appears via doGet(listSponsorshipPackages) after doPost(createSponsorshipPackage)', list.some(function (p) { return p.id === pkgId; }), true);
+  check('Package placements round-trips as a real array', list.find(function (p) { return p.id === pkgId; }).placements, placements);
+  check('Package blendGroups round-trips as a real array', list.find(function (p) { return p.id === pkgId; }).blendGroups, blendGroups);
+
+  doPost({ parameter: { action: 'updateSponsorshipPackage', payload: JSON.stringify({ id: pkgId, name: 'Cutover Test Package Renamed' }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listSponsorshipPackages' } }).getContent());
+  check('Package renamed via doPost(updateSponsorshipPackage)', list.find(function (p) { return p.id === pkgId; }).name, 'Cutover Test Package Renamed');
+
+  // deleteSeasonYear's cascade -- field cleared to ''.
+  const seasonYearId = Utilities.getUuid();
+  doPost({ parameter: { action: 'createSeasonYear', payload: JSON.stringify({ id: seasonYearId, showId: '', name: 'Cutover Test Season' }) } });
+  updateRecordSql_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'id', pkgId, { id: pkgId, seasonYearId: seasonYearId });
+  doPost({ parameter: { action: 'deleteSeasonYear', payload: JSON.stringify({ id: seasonYearId }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listSponsorshipPackages' } }).getContent());
+  check('Package seasonYearId cleared via doPost(deleteSeasonYear)', list.find(function (p) { return p.id === pkgId; }).seasonYearId, '');
+
+  // deleteTentpoleShow's cascade -- both its own showId field AND (via a
+  // child SeasonYear) the seasonYearId field get cleared in one call.
+  const showId = Utilities.getUuid();
+  const childSeasonYearId = Utilities.getUuid();
+  doPost({ parameter: { action: 'createTentpoleShow', payload: JSON.stringify({ id: showId, name: 'Cutover Test Show ' + showId }) } });
+  doPost({ parameter: { action: 'createSeasonYear', payload: JSON.stringify({ id: childSeasonYearId, showId: showId, name: 'Child Season' }) } });
+  updateRecordSql_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'id', pkgId, { id: pkgId, showId: showId, seasonYearId: childSeasonYearId });
+  doPost({ parameter: { action: 'deleteTentpoleShow', payload: JSON.stringify({ id: showId }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listSponsorshipPackages' } }).getContent());
+  const pkgAfterShowDelete = list.find(function (p) { return p.id === pkgId; });
+  check('Package showId cleared via doPost(deleteTentpoleShow)', pkgAfterShowDelete.showId, '');
+  check('Package seasonYearId cleared via doPost(deleteTentpoleShow) (child SeasonYear bulk-delete)', pkgAfterShowDelete.seasonYearId, '');
+
+  doPost({ parameter: { action: 'deleteSponsorshipPackage', payload: JSON.stringify({ id: pkgId }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listSponsorshipPackages' } }).getContent());
+  check('Package gone via doGet(listSponsorshipPackages) after doPost(deleteSponsorshipPackage)', list.some(function (p) { return p.id === pkgId; }), false);
 
   Logger.log(results.join('\n'));
 }
