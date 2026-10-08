@@ -475,7 +475,8 @@ function lookupValueSql_(sheetName, keyField, key, valueField) {
 
 function applyProjectLookups_(values) {
   if (values.pitchLeadName) {
-    values.pitchTeam = lookupValue_(SHEET_NAMES.teamRoster, 'teamMemberName', values.pitchLeadName, 'pitchTeam');
+    // cut over to SQL Connect 2026-10-08 (Phase 4)
+    values.pitchTeam = lookupValueSql_(SHEET_NAMES.teamRoster, 'teamMemberName', values.pitchLeadName, 'pitchTeam');
   }
   if (values.agency) {
     // cut over to SQL Connect 2026-10-08 (Phase 4)
@@ -714,7 +715,7 @@ function doGet(e) {
     } else if (action === 'listUsers') {
       result = readRows_(SHEET_NAMES.users);
     } else if (action === 'listTeamRoster') {
-      result = readRows_(SHEET_NAMES.teamRoster);
+      result = readRowsSql_(SHEET_NAMES.teamRoster); // cut over to SQL Connect 2026-10-08 (Phase 4)
     } else if (action === 'listAgencyHoldCo') {
       result = readRowsSql_(SHEET_NAMES.agencyHoldCo); // cut over to SQL Connect 2026-10-08 (Phase 4)
     } else if (action === 'listHoldCos') {
@@ -894,7 +895,7 @@ function doPost(e) {
   } else if (action === 'createTeamRosterEntry') {
     requireWrite_(user);
     withLock_(function () {
-      appendRecord_(SHEET_NAMES.teamRoster, TEAM_ROSTER_FIELDS, values);
+      appendRecordSql_(SHEET_NAMES.teamRoster, TEAM_ROSTER_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'createAgencyHoldCoEntry') {
     requireWrite_(user);
@@ -904,12 +905,12 @@ function doPost(e) {
   } else if (action === 'updateTeamRosterEntry') {
     requireWrite_(user);
     withLock_(function () {
-      updateRecord_(SHEET_NAMES.teamRoster, TEAM_ROSTER_FIELDS, 'teamMemberName', values.teamMemberName, values);
+      updateRecordSql_(SHEET_NAMES.teamRoster, TEAM_ROSTER_FIELDS, 'teamMemberName', values.teamMemberName, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'deleteTeamRosterEntry') {
     requireWrite_(user);
     withLock_(function () {
-      deleteRowByKey_(SHEET_NAMES.teamRoster, TEAM_ROSTER_FIELDS, 'teamMemberName', values.teamMemberName);
+      deleteRowByKeySql_(SHEET_NAMES.teamRoster, TEAM_ROSTER_FIELDS, 'teamMemberName', values.teamMemberName); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'updateAgencyHoldCoEntry') {
     requireWrite_(user);
@@ -958,18 +959,16 @@ function doPost(e) {
       appendRecordSql_(SHEET_NAMES.pitchTeams, PITCH_TEAM_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'updatePitchTeam') {
-    // TeamRoster isn't cut over yet, so its cascade deliberately stays on
-    // the Sheets-backed cascadeForeignKey_.
     requireWrite_(user);
     withLock_(function () {
       updateRecordSql_(SHEET_NAMES.pitchTeams, PITCH_TEAM_FIELDS, 'name', values.originalName, { name: values.name }); // cut over to SQL Connect 2026-10-08 (Phase 4)
-      cascadeForeignKey_(SHEET_NAMES.teamRoster, TEAM_ROSTER_FIELDS, 'pitchTeam', values.originalName, values.name);
+      cascadeForeignKeySql_(SHEET_NAMES.teamRoster, TEAM_ROSTER_FIELDS, 'pitchTeam', values.originalName, values.name); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'deletePitchTeam') {
     requireWrite_(user);
     withLock_(function () {
       deleteRowByKeySql_(SHEET_NAMES.pitchTeams, PITCH_TEAM_FIELDS, 'name', values.name); // cut over to SQL Connect 2026-10-08 (Phase 4)
-      cascadeForeignKey_(SHEET_NAMES.teamRoster, TEAM_ROSTER_FIELDS, 'pitchTeam', values.name, '');
+      cascadeForeignKeySql_(SHEET_NAMES.teamRoster, TEAM_ROSTER_FIELDS, 'pitchTeam', values.name, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'createUser') {
     requireWrite_(user);
@@ -2268,4 +2267,59 @@ function testAgencyHoldCoCutover() {
 function diagnoseAgencyHoldCoListSize() {
   const rows = readRowsSql_(SHEET_NAMES.agencyHoldCo);
   Logger.log('readRowsSql_(agencyHoldCo) returned ' + rows.length + ' rows');
+}
+
+function migrateTeamRosterToSql() {
+  const existingSql = readRowsSql_(SHEET_NAMES.teamRoster);
+  const existingNames = new Set(existingSql.map(function (r) { return r.teamMemberName; }));
+  const sheetRows = readRows_(SHEET_NAMES.teamRoster);
+  let migrated = 0, skipped = 0;
+  sheetRows.forEach(function (row) {
+    if (existingNames.has(row.teamMemberName)) { skipped++; return; }
+    appendRecordSql_(SHEET_NAMES.teamRoster, TEAM_ROSTER_FIELDS, row);
+    existingNames.add(row.teamMemberName);
+    migrated++;
+  });
+  Logger.log('TeamRoster migration: migrated=' + migrated + ' skipped=' + skipped + ' (sheet had ' + sheetRows.length + ' total)');
+}
+
+// One-time manual check (confirmed 2026-10-08; run from the Apps Script
+// editor's Run button) -- Phase 4 cutover verification for TeamRoster,
+// same pattern as testAgencyHoldCoCutover. Also exercises the pitchTeam-
+// rename cascade (now SQL-backed via cascadeForeignKeySql_ in
+// updatePitchTeam) to confirm TeamRoster rows referencing a renamed
+// PitchTeam get updated too.
+function testTeamRosterCutover() {
+  const results = [];
+  function check(label, actual, expected) {
+    const pass = JSON.stringify(actual) === JSON.stringify(expected);
+    results.push((pass ? 'PASS' : 'FAIL') + ' -- ' + label + (pass ? '' : (': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual))));
+  }
+
+  const memberName = 'Cutover Test Member ' + Utilities.getUuid();
+  const pitchTeamName = 'Cutover Test PitchTeam ' + Utilities.getUuid();
+  const pitchTeamRenamed = pitchTeamName + ' Renamed';
+
+  doPost({ parameter: { action: 'createTeamRosterEntry', payload: JSON.stringify({ teamMemberName: memberName, pitchTeam: '' }) } });
+  let list = JSON.parse(doGet({ parameter: { action: 'listTeamRoster' } }).getContent());
+  check('Member appears via doGet(listTeamRoster) after doPost(createTeamRosterEntry)', list.some(function (r) { return r.teamMemberName === memberName; }), true);
+
+  doPost({ parameter: { action: 'createPitchTeam', payload: JSON.stringify({ name: pitchTeamName }) } });
+  doPost({ parameter: { action: 'updateTeamRosterEntry', payload: JSON.stringify({ teamMemberName: memberName, pitchTeam: pitchTeamName }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listTeamRoster' } }).getContent());
+  check('Member pitchTeam updated via doPost(updateTeamRosterEntry)', list.find(function (r) { return r.teamMemberName === memberName; }).pitchTeam, pitchTeamName);
+
+  doPost({ parameter: { action: 'updatePitchTeam', payload: JSON.stringify({ originalName: pitchTeamName, name: pitchTeamRenamed }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listTeamRoster' } }).getContent());
+  check('Member pitchTeam cascaded via doPost(updatePitchTeam) rename', list.find(function (r) { return r.teamMemberName === memberName; }).pitchTeam, pitchTeamRenamed);
+
+  doPost({ parameter: { action: 'deletePitchTeam', payload: JSON.stringify({ name: pitchTeamRenamed }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listTeamRoster' } }).getContent());
+  check('Member pitchTeam cleared via doPost(deletePitchTeam) cascade', list.find(function (r) { return r.teamMemberName === memberName; }).pitchTeam, '');
+
+  doPost({ parameter: { action: 'deleteTeamRosterEntry', payload: JSON.stringify({ teamMemberName: memberName }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listTeamRoster' } }).getContent());
+  check('Member gone via doGet(listTeamRoster) after doPost(deleteTeamRosterEntry)', list.some(function (r) { return r.teamMemberName === memberName; }), false);
+
+  Logger.log(results.join('\n'));
 }
