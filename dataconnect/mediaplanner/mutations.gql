@@ -259,3 +259,6 @@ mutation DeleteSeasonYearsByShowId($showId: String) @auth(level: NO_ACCESS) {
 mutation DeletePlacementMenuItemsByCategoryId($categoryId: String) @auth(level: NO_ACCESS) {
   placementMenuItem_deleteMany(where: { categoryId: { eq: $categoryId } })
 }
+mutation DeleteProjectFileLinksByProjectId($projectId: String) @auth(level: NO_ACCESS) {
+  projectFileLink_deleteMany(where: { projectId: { eq: $projectId } })
+}

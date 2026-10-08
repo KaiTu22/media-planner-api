@@ -644,15 +644,10 @@ function deleteProject_(projectId) {
     }
   }
 
-  const linksSheet = getSheet_(SHEET_NAMES.projectFileLinks);
-  const lHeaders = ensureColumns_(linksSheet, PROJECT_FILE_LINK_FIELDS);
-  const lProjectIdx = lHeaders.indexOf('projectId');
-  const lData = linksSheet.getDataRange().getValues();
-  for (let r = lData.length - 1; r >= 1; r--) {
-    if (lData[r][lProjectIdx] === projectId) {
-      linksSheet.deleteRow(r + 1);
-    }
-  }
+  // cut over to SQL Connect 2026-10-08 (Phase 4) -- ProjectFileLinks itself
+  // is cut over now; Projects isn't, so the raw Sheets loop above (Versions)
+  // and below (the Project row itself) stay as-is deliberately.
+  deleteRowsByForeignKeySql_(SHEET_NAMES.projectFileLinks, PROJECT_FILE_LINK_FIELDS, 'projectId', projectId);
 
   const sheet = getSheet_(SHEET_NAMES.projects);
   const headers = ensureColumns_(sheet, PROJECT_FIELDS);
@@ -705,7 +700,7 @@ function doGet(e) {
     if (action === 'listProjectFiles') {
       result = listProjectFiles_(e.parameter.projectId);
     } else if (action === 'listProjectFileLinks') {
-      result = readRows_(SHEET_NAMES.projectFileLinks).filter(function (r) { return r.projectId === e.parameter.projectId; });
+      result = readRowsSql_(SHEET_NAMES.projectFileLinks).filter(function (r) { return r.projectId === e.parameter.projectId; }); // cut over to SQL Connect 2026-10-08 (Phase 4)
     } else if (action === 'listTags') {
       result = readRowsSql_(SHEET_NAMES.tags); // cut over to SQL Connect 2026-10-08 (Phase 4, Tags first)
     } else if (action === 'listProjects') {
@@ -816,22 +811,13 @@ function doPost(e) {
     values.createdAt = now;
     values.createdBy = user.email;
     withLock_(function () {
-      appendRecord_(SHEET_NAMES.projectFileLinks, PROJECT_FILE_LINK_FIELDS, values);
+      appendRecordSql_(SHEET_NAMES.projectFileLinks, PROJECT_FILE_LINK_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
     return ContentService.createTextOutput('ok').setMimeType(ContentService.MimeType.TEXT);
   } else if (action === 'deleteProjectFileLink') {
     requireWrite_(user);
     withLock_(function () {
-      const sheet = getSheet_(SHEET_NAMES.projectFileLinks);
-      const headers = ensureColumns_(sheet, PROJECT_FILE_LINK_FIELDS);
-      const idIdx = headers.indexOf('id');
-      const data = sheet.getDataRange().getValues();
-      for (let r = data.length - 1; r >= 1; r--) {
-        if (data[r][idIdx] === values.id) {
-          sheet.deleteRow(r + 1);
-          break;
-        }
-      }
+      deleteRowByKeySql_(SHEET_NAMES.projectFileLinks, PROJECT_FILE_LINK_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
     return ContentService.createTextOutput('ok').setMimeType(ContentService.MimeType.TEXT);
   } else if (action === 'uploadProjectAttachment') {
@@ -1752,6 +1738,9 @@ mutation DeleteSeasonYearsByShowId($showId: String) {
 mutation DeletePlacementMenuItemsByCategoryId($categoryId: String) {
   placementMenuItem_deleteMany(where: { categoryId: { eq: $categoryId } })
 }
+mutation DeleteProjectFileLinksByProjectId($projectId: String) {
+  projectFileLink_deleteMany(where: { projectId: { eq: $projectId } })
+}
 `;
 
 function executeDataConnect_(operationName, variables) {
@@ -1919,6 +1908,7 @@ DC_BULK_UPDATE_OP_[SHEET_NAMES.sponsorshipPackages + '|showId'] = 'UpdateSponsor
 const DC_BULK_DELETE_OP_ = {};
 DC_BULK_DELETE_OP_[SHEET_NAMES.seasonYears + '|showId'] = 'DeleteSeasonYearsByShowId';
 DC_BULK_DELETE_OP_[SHEET_NAMES.placementMenuItems + '|categoryId'] = 'DeletePlacementMenuItemsByCategoryId';
+DC_BULK_DELETE_OP_[SHEET_NAMES.projectFileLinks + '|projectId'] = 'DeleteProjectFileLinksByProjectId';
 
 function cascadeForeignKeySql_(sheetName, fields, foreignKeyField, oldValue, newValue) {
   const opName = DC_BULK_UPDATE_OP_[sheetName + '|' + foreignKeyField];
@@ -2519,6 +2509,58 @@ function testUsersCutover() {
   doPost({ parameter: { action: 'deleteUser', payload: JSON.stringify({ email: email }) } });
   list = JSON.parse(doGet({ parameter: { action: 'listUsers' } }).getContent());
   check('User gone via doGet(listUsers) after doPost(deleteUser)', list.some(function (u) { return u.email === email; }), false);
+
+  Logger.log(results.join('\n'));
+}
+
+function migrateProjectFileLinksToSql() {
+  const existingSql = readRowsSql_(SHEET_NAMES.projectFileLinks);
+  const existingIds = new Set(existingSql.map(function (l) { return l.id; }));
+  const sheetRows = readRows_(SHEET_NAMES.projectFileLinks);
+  let migrated = 0, skipped = 0;
+  sheetRows.forEach(function (row) {
+    if (existingIds.has(row.id)) { skipped++; return; }
+    appendRecordSql_(SHEET_NAMES.projectFileLinks, PROJECT_FILE_LINK_FIELDS, row);
+    existingIds.add(row.id);
+    migrated++;
+  });
+  Logger.log('ProjectFileLinks migration: migrated=' + migrated + ' skipped=' + skipped + ' (sheet had ' + sheetRows.length + ' total)');
+}
+
+// One-time manual check (confirmed 2026-10-08; run from the Apps Script
+// editor's Run button) -- Phase 4 cutover verification for ProjectFileLinks.
+// Also exercises deleteProject_'s cascade (now SQL-backed via
+// deleteRowsByForeignKeySql_) -- but calls deleteProject_ directly rather
+// than doPost({action:'deleteProject'}), and appends the test Project row
+// straight to the Sheet via appendRecord_, both to avoid the real
+// createProject/deleteProject action handlers' side effects (Drive folder
+// creation via createProjectFolder_), which don't belong in a storage-
+// layer cutover test. Projects itself isn't cut over yet, so this test
+// Project row lives only in Sheets, same as real ones today.
+function testProjectFileLinksCutover() {
+  const results = [];
+  function check(label, actual, expected) {
+    const pass = JSON.stringify(actual) === JSON.stringify(expected);
+    results.push((pass ? 'PASS' : 'FAIL') + ' -- ' + label + (pass ? '' : (': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual))));
+  }
+
+  const projectId = 'cutover-test-project-' + Utilities.getUuid();
+  appendRecord_(SHEET_NAMES.projects, PROJECT_FIELDS, { id: projectId, projectName: 'Cutover Test Project' });
+
+  const linkId = Utilities.getUuid();
+  doPost({ parameter: { action: 'addProjectFileLink', payload: JSON.stringify({ id: linkId, projectId: projectId, name: 'Test Link', url: 'https://example.com' }) } });
+  let list = JSON.parse(doGet({ parameter: { action: 'listProjectFileLinks', projectId: projectId } }).getContent());
+  check('Link appears via doGet(listProjectFileLinks) after doPost(addProjectFileLink)', list.some(function (l) { return l.id === linkId; }), true);
+
+  const linkId2 = Utilities.getUuid();
+  doPost({ parameter: { action: 'addProjectFileLink', payload: JSON.stringify({ id: linkId2, projectId: projectId, name: 'Test Link 2', url: 'https://example.com/2' }) } });
+  doPost({ parameter: { action: 'deleteProjectFileLink', payload: JSON.stringify({ id: linkId2 }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listProjectFileLinks', projectId: projectId } }).getContent());
+  check('Link gone via doGet(listProjectFileLinks) after doPost(deleteProjectFileLink)', list.some(function (l) { return l.id === linkId2; }), false);
+
+  deleteProject_(projectId);
+  list = JSON.parse(doGet({ parameter: { action: 'listProjectFileLinks', projectId: projectId } }).getContent());
+  check('Remaining link bulk-deleted via deleteProject_ cascade', list.some(function (l) { return l.id === linkId; }), false);
 
   Logger.log(results.join('\n'));
 }
