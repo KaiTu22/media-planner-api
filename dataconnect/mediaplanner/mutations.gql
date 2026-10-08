@@ -262,3 +262,6 @@ mutation DeletePlacementMenuItemsByCategoryId($categoryId: String) @auth(level: 
 mutation DeleteProjectFileLinksByProjectId($projectId: String) @auth(level: NO_ACCESS) {
   projectFileLink_deleteMany(where: { projectId: { eq: $projectId } })
 }
+mutation DeleteVersionsByProjectId($projectId: String) @auth(level: NO_ACCESS) {
+  version_deleteMany(where: { projectId: { eq: $projectId } })
+}

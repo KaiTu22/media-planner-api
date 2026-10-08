@@ -634,20 +634,10 @@ function createTag_(values) {
 // uploaded is a much bigger, harder-to-reverse action than removing a sheet
 // row, and isn't what "delete this project" was asked for.
 function deleteProject_(projectId) {
-  // cut over to SQL Connect 2026-10-08 (Phase 4) -- Versions isn't cut over
-  // yet, so its raw Sheets loop stays as-is deliberately.
-  const versionsSheet = getSheet_(SHEET_NAMES.versions);
-  const vHeaders = ensureColumns_(versionsSheet, VERSION_FIELDS);
-  const vProjectIdx = vHeaders.indexOf('projectId');
-  const vData = versionsSheet.getDataRange().getValues();
-  for (let r = vData.length - 1; r >= 1; r--) {
-    if (vData[r][vProjectIdx] === projectId) {
-      versionsSheet.deleteRow(r + 1);
-    }
-  }
-
+  // cut over to SQL Connect 2026-10-08 (Phase 4)
+  deleteRowsByForeignKeySql_(SHEET_NAMES.versions, VERSION_FIELDS, 'projectId', projectId);
   deleteRowsByForeignKeySql_(SHEET_NAMES.projectFileLinks, PROJECT_FILE_LINK_FIELDS, 'projectId', projectId);
-  deleteRowByKeySql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'id', projectId); // cut over to SQL Connect 2026-10-08 (Phase 4)
+  deleteRowByKeySql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'id', projectId);
 }
 
 // Removes a tag from the managed list and strips it from every project
@@ -695,7 +685,7 @@ function doGet(e) {
     } else if (action === 'listProjects') {
       result = readRowsSql_(SHEET_NAMES.projects); // cut over to SQL Connect 2026-10-08 (Phase 4)
     } else if (action === 'listVersions') {
-      result = readRows_(SHEET_NAMES.versions);
+      result = readRowsSql_(SHEET_NAMES.versions); // cut over to SQL Connect 2026-10-08 (Phase 4)
     } else if (action === 'listUsers') {
       result = readRowsSql_(SHEET_NAMES.users); // cut over to SQL Connect 2026-10-08 (Phase 4)
     } else if (action === 'listTeamRoster') {
@@ -853,19 +843,19 @@ function doPost(e) {
     values.updatedAt = now;
     values.updatedBy = user.email;
     withLock_(function () {
-      appendRecord_(SHEET_NAMES.versions, VERSION_FIELDS, values);
+      appendRecordSql_(SHEET_NAMES.versions, VERSION_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'updateVersion') {
     requireWrite_(user);
     values.updatedAt = now;
     values.updatedBy = user.email;
     withLock_(function () {
-      updateRecord_(SHEET_NAMES.versions, VERSION_FIELDS, 'id', values.id, values);
+      updateRecordSql_(SHEET_NAMES.versions, VERSION_FIELDS, 'id', values.id, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'deleteVersion') {
     requireWrite_(user);
     withLock_(function () {
-      deleteRowByKey_(SHEET_NAMES.versions, VERSION_FIELDS, 'id', values.id);
+      deleteRowByKeySql_(SHEET_NAMES.versions, VERSION_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
   } else if (action === 'createTeamRosterEntry') {
     requireWrite_(user);
@@ -1727,6 +1717,9 @@ mutation DeletePlacementMenuItemsByCategoryId($categoryId: String) {
 mutation DeleteProjectFileLinksByProjectId($projectId: String) {
   projectFileLink_deleteMany(where: { projectId: { eq: $projectId } })
 }
+mutation DeleteVersionsByProjectId($projectId: String) {
+  version_deleteMany(where: { projectId: { eq: $projectId } })
+}
 `;
 
 function executeDataConnect_(operationName, variables) {
@@ -1901,6 +1894,7 @@ const DC_BULK_DELETE_OP_ = {};
 DC_BULK_DELETE_OP_[SHEET_NAMES.seasonYears + '|showId'] = 'DeleteSeasonYearsByShowId';
 DC_BULK_DELETE_OP_[SHEET_NAMES.placementMenuItems + '|categoryId'] = 'DeletePlacementMenuItemsByCategoryId';
 DC_BULK_DELETE_OP_[SHEET_NAMES.projectFileLinks + '|projectId'] = 'DeleteProjectFileLinksByProjectId';
+DC_BULK_DELETE_OP_[SHEET_NAMES.versions + '|projectId'] = 'DeleteVersionsByProjectId';
 
 function cascadeForeignKeySql_(sheetName, fields, foreignKeyField, oldValue, newValue) {
   const opName = DC_BULK_UPDATE_OP_[sheetName + '|' + foreignKeyField];
@@ -2726,6 +2720,59 @@ function testProjectsCutover() {
   const liveProject = list.find(function (p) { return p.id === liveProjectId; });
   check('Real createProject action writes to SQL and gets a Drive folder', !!(liveProject && liveProject.folderId), true);
   deleteProject_(liveProjectId);
+
+  Logger.log(results.join('\n'));
+}
+
+function migrateVersionsToSql() {
+  const existingSql = readRowsSql_(SHEET_NAMES.versions);
+  const existingIds = new Set(existingSql.map(function (v) { return v.id; }));
+  const sheetRows = readRows_(SHEET_NAMES.versions);
+  let migrated = 0, skipped = 0;
+  sheetRows.forEach(function (row) {
+    if (existingIds.has(row.id)) { skipped++; return; }
+    appendRecordSql_(SHEET_NAMES.versions, VERSION_FIELDS, row);
+    existingIds.add(row.id);
+    migrated++;
+  });
+  Logger.log('Versions migration: migrated=' + migrated + ' skipped=' + skipped + ' (sheet had ' + sheetRows.length + ' total)');
+}
+
+// One-time manual check (confirmed 2026-10-08; run from the Apps Script
+// editor's Run button) -- Phase 4 cutover verification for Versions.
+// Also exercises deleteProject_'s bulk-delete cascade into Versions (now
+// SQL-backed via deleteRowsByForeignKeySql_, same as ProjectFileLinks),
+// and 'packages' JSON_FIELDS blob round-tripping as a real array.
+function testVersionsCutover() {
+  const results = [];
+  function check(label, actual, expected) {
+    const pass = JSON.stringify(actual) === JSON.stringify(expected);
+    results.push((pass ? 'PASS' : 'FAIL') + ' -- ' + label + (pass ? '' : (': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual))));
+  }
+
+  const projectId = 'cutover-test-project-' + Utilities.getUuid();
+  appendRecordSql_(SHEET_NAMES.projects, PROJECT_FIELDS, { id: projectId, projectName: 'Cutover Test Project' });
+
+  const versionId = Utilities.getUuid();
+  const packages = [{ title: 'Test Package', investment: 1000 }];
+  doPost({ parameter: { action: 'createVersion', payload: JSON.stringify({ id: versionId, projectId: projectId, name: 'v1', packages: packages }) } });
+  let list = JSON.parse(doGet({ parameter: { action: 'listVersions' } }).getContent());
+  check('Version appears via doGet(listVersions) after doPost(createVersion)', list.some(function (v) { return v.id === versionId; }), true);
+  check('Version packages round-trips as a real array', list.find(function (v) { return v.id === versionId; }).packages, packages);
+
+  doPost({ parameter: { action: 'updateVersion', payload: JSON.stringify({ id: versionId, name: 'v1 Renamed' }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listVersions' } }).getContent());
+  check('Version renamed via doPost(updateVersion)', list.find(function (v) { return v.id === versionId; }).name, 'v1 Renamed');
+
+  const versionId2 = Utilities.getUuid();
+  doPost({ parameter: { action: 'createVersion', payload: JSON.stringify({ id: versionId2, projectId: projectId, name: 'v2' }) } });
+  doPost({ parameter: { action: 'deleteVersion', payload: JSON.stringify({ id: versionId2 }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listVersions' } }).getContent());
+  check('Version gone via doGet(listVersions) after doPost(deleteVersion)', list.some(function (v) { return v.id === versionId2; }), false);
+
+  deleteProject_(projectId);
+  list = JSON.parse(doGet({ parameter: { action: 'listVersions' } }).getContent());
+  check('Remaining version bulk-deleted via deleteProject_ cascade', list.some(function (v) { return v.id === versionId; }), false);
 
   Logger.log(results.join('\n'));
 }
