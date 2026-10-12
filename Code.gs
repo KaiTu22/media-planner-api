@@ -1720,7 +1720,17 @@ mutation DeleteVersionsByProjectId($projectId: String) {
 }
 `;
 
-function executeDataConnect_(operationName, variables) {
+// Confirmed 2026-10-12 (via runAllTests): under sustained load, the SQL
+// Connect API occasionally returns a non-JSON HTML error page instead of
+// a GraphQL response (an infrastructure-level 5xx, not a GraphQL-level
+// error -- those still come back as JSON with a body.errors array,
+// handled below as before). Without this, that surfaced as a cryptic
+// "Unexpected token '<' ... is not valid JSON" with no indication of what
+// actually went wrong, for what is usually a transient blip that clears
+// up a moment later -- one retry after a short pause, same philosophy as
+// jsonpRequest's own retry-before-surfacing-an-error logic on the
+// frontend side.
+function executeDataConnect_(operationName, variables, _isRetry) {
   const response = UrlFetchApp.fetch(DATA_CONNECT_URL_, {
     method: 'post',
     contentType: 'application/json',
@@ -1728,7 +1738,18 @@ function executeDataConnect_(operationName, variables) {
     payload: JSON.stringify({ query: DATA_CONNECT_OPERATIONS_, operationName: operationName, variables: variables || {} }),
     muteHttpExceptions: true,
   });
-  const body = JSON.parse(response.getContentText());
+  const status = response.getResponseCode();
+  const text = response.getContentText();
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch (e) {
+    if (!_isRetry) {
+      Utilities.sleep(500);
+      return executeDataConnect_(operationName, variables, true);
+    }
+    throw new Error('Data Connect returned a non-JSON response (HTTP ' + status + ') for ' + operationName + ': ' + text.slice(0, 200));
+  }
   if (body.errors) {
     throw new Error('Data Connect error in ' + operationName + ': ' + JSON.stringify(body.errors));
   }
@@ -1984,6 +2005,7 @@ function testSqlStorageLayer() {
   deleteRowByKeySql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'id', projectId);
 
   Logger.log(results.join('\n'));
+  return results;
 }
 
 // One-time manual check (confirmed 2026-10-08; run from the Apps Script
@@ -2033,6 +2055,7 @@ function testTagsCutover() {
   });
 
   Logger.log(results.join('\n'));
+  return results;
 }
 
 // One-time data migration (confirmed 2026-10-08; run from the Apps Script
@@ -2103,6 +2126,7 @@ function testHoldCosCutover() {
   check('HoldCo gone via doGet(listHoldCos) after doPost(deleteHoldCo)', list.some(function (h) { return h.name === renamed; }), false);
 
   Logger.log(results.join('\n'));
+  return results;
 }
 
 function migratePitchTeamsToSql() {
@@ -2141,6 +2165,7 @@ function testPitchTeamsCutover() {
   check('PitchTeam gone via doGet(listPitchTeams) after doPost(deletePitchTeam)', list.some(function (p) { return p.name === renamed; }), false);
 
   Logger.log(results.join('\n'));
+  return results;
 }
 
 function migrateTentpoleShowsToSql() {
@@ -2179,6 +2204,7 @@ function testTentpoleShowsCutover() {
   check('Show gone via doGet(listTentpoleShows) after doPost(deleteTentpoleShow)', list.some(function (s) { return s.id === id; }), false);
 
   Logger.log(results.join('\n'));
+  return results;
 }
 
 function migrateAgencyHoldCoToSql() {
@@ -2243,6 +2269,7 @@ function testAgencyHoldCoCutover() {
   check('Agency gone via doGet(listAgencyHoldCo) after doPost(deleteAgencyHoldCoEntry)', list.some(function (a) { return a.agency === renamed; }), false);
 
   Logger.log(results.join('\n'));
+  return results;
 }
 
 // Diagnostic for the 2026-10-08 AgencyHoldCo cutover test failure -- checks
@@ -2309,6 +2336,7 @@ function testTeamRosterCutover() {
   check('Member gone via doGet(listTeamRoster) after doPost(deleteTeamRosterEntry)', list.some(function (r) { return r.teamMemberName === memberName; }), false);
 
   Logger.log(results.join('\n'));
+  return results;
 }
 
 function migrateSeasonYearsToSql() {
@@ -2370,6 +2398,7 @@ function testSeasonYearsCutover() {
   check('Child SeasonYear bulk-deleted via doPost(deleteTentpoleShow) cascade', list.some(function (s) { return s.id === childId; }), false);
 
   Logger.log(results.join('\n'));
+  return results;
 }
 
 function migratePlacementCategoriesToSql() {
@@ -2445,6 +2474,7 @@ function testPlacementCategoriesAndMenuItemsCutover() {
   check('MenuItem bulk-deleted via doPost(deletePlacementCategory) cascade', items.some(function (m) { return m.id === itemId; }), false);
 
   Logger.log(results.join('\n'));
+  return results;
 }
 
 function migrateUsersToSql() {
@@ -2495,6 +2525,7 @@ function testUsersCutover() {
   check('User gone via doGet(listUsers) after doPost(deleteUser)', list.some(function (u) { return u.email === email; }), false);
 
   Logger.log(results.join('\n'));
+  return results;
 }
 
 function migrateProjectFileLinksToSql() {
@@ -2547,6 +2578,7 @@ function testProjectFileLinksCutover() {
   check('Remaining link bulk-deleted via deleteProject_ cascade', list.some(function (l) { return l.id === linkId; }), false);
 
   Logger.log(results.join('\n'));
+  return results;
 }
 
 // Only these two are genuinely numeric (GraphQL Float) -- every other
@@ -2609,6 +2641,7 @@ function testClosedDealsCutover() {
   check('Deal gone via doGet(listClosedDeals) after doPost(deleteClosedDeal)', list.some(function (d) { return d.deal_id === dealId; }), false);
 
   Logger.log(results.join('\n'));
+  return results;
 }
 
 // rushRequest is a GraphQL Boolean, but Sheets checkbox-less cells can hold
@@ -2720,6 +2753,7 @@ function testProjectsCutover() {
   deleteProject_(liveProjectId);
 
   Logger.log(results.join('\n'));
+  return results;
 }
 
 function migrateVersionsToSql() {
@@ -2773,6 +2807,7 @@ function testVersionsCutover() {
   check('Remaining version bulk-deleted via deleteProject_ cascade', list.some(function (v) { return v.id === versionId; }), false);
 
   Logger.log(results.join('\n'));
+  return results;
 }
 
 function migrateSponsorshipPackagesToSql() {
@@ -2843,4 +2878,111 @@ function testSponsorshipPackagesCutover() {
   check('Package gone via doGet(listSponsorshipPackages) after doPost(deleteSponsorshipPackage)', list.some(function (p) { return p.id === pkgId; }), false);
 
   Logger.log(results.join('\n'));
+  return results;
+}
+
+// Diagnostic (2026-10-08) -- investigates post-cutover timeout reports by
+// timing every entity's readRowsSql_ call individually, plus
+// getServiceAccountAccessToken_ cold vs. warm (to confirm the CacheService
+// token cache from the Users cutover is actually being hit).
+function diagnoseSqlReadLatency() {
+  CacheService.getScriptCache().remove('sql_connect_access_token');
+  const t0 = Date.now();
+  getServiceAccountAccessToken_();
+  const coldTokenMs = Date.now() - t0;
+  const t1 = Date.now();
+  getServiceAccountAccessToken_();
+  const warmTokenMs = Date.now() - t1;
+  Logger.log('Access token: cold=' + coldTokenMs + 'ms warm(cached)=' + warmTokenMs + 'ms');
+
+  const entities = [
+    SHEET_NAMES.tags, SHEET_NAMES.holdCos, SHEET_NAMES.pitchTeams, SHEET_NAMES.tentpoleShows,
+    SHEET_NAMES.agencyHoldCo, SHEET_NAMES.teamRoster, SHEET_NAMES.seasonYears,
+    SHEET_NAMES.placementCategories, SHEET_NAMES.placementMenuItems, SHEET_NAMES.users,
+    SHEET_NAMES.projectFileLinks, SHEET_NAMES.closedDeals, SHEET_NAMES.projects,
+    SHEET_NAMES.versions, SHEET_NAMES.sponsorshipPackages,
+  ];
+  entities.forEach(function (sheetName) {
+    const start = Date.now();
+    let rows;
+    try {
+      rows = readRowsSql_(sheetName);
+    } catch (e) {
+      Logger.log(sheetName + ': ERROR -- ' + e.message);
+      return;
+    }
+    Logger.log(sheetName + ': ' + rows.length + ' rows in ' + (Date.now() - start) + 'ms');
+  });
+}
+
+// =====================================================================
+// Full regression suite (added 2026-10-12) -- runs every *Cutover()/
+// testSqlStorageLayer test in one pass instead of the 15 separate
+// functions needing to be found and run individually. This is the
+// closest thing this backend has to an automated test suite: Apps
+// Script has no native CI runner, and the domain-restricted web app
+// auth model (see media-planner-app/src/api/appsScript.js's own
+// comments) means there's no simple bearer-token way for an external
+// CI system to call in as an authenticated user either -- so for now
+// this stays a manually-run, one-click regression check rather than a
+// true CI gate.
+//
+// STANDING PRACTICE: run this from the Apps Script editor (select
+// runAllTests, click Run) after ANY change to Code.gs, before pushing
+// live -- not just for the specific entity you touched. Every one of
+// these tests creates its own randomly-named rows and cleans them up
+// afterward, so it's safe to run repeatedly against the live Postgres
+// data without side effects, with one exception: testProjectsCutover's
+// real end-to-end createProject check leaves behind one real (harmless)
+// Drive folder each run -- see that function's own header comment.
+function runAllTests() {
+  const suites = [
+    ['SqlStorageLayer', testSqlStorageLayer],
+    ['TagsCutover', testTagsCutover],
+    ['HoldCosCutover', testHoldCosCutover],
+    ['PitchTeamsCutover', testPitchTeamsCutover],
+    ['TentpoleShowsCutover', testTentpoleShowsCutover],
+    ['AgencyHoldCoCutover', testAgencyHoldCoCutover],
+    ['TeamRosterCutover', testTeamRosterCutover],
+    ['SeasonYearsCutover', testSeasonYearsCutover],
+    ['PlacementCategoriesAndMenuItemsCutover', testPlacementCategoriesAndMenuItemsCutover],
+    ['UsersCutover', testUsersCutover],
+    ['ProjectFileLinksCutover', testProjectFileLinksCutover],
+    ['ClosedDealsCutover', testClosedDealsCutover],
+    ['ProjectsCutover', testProjectsCutover],
+    ['VersionsCutover', testVersionsCutover],
+    ['SponsorshipPackagesCutover', testSponsorshipPackagesCutover],
+  ];
+
+  let totalPass = 0, totalFail = 0;
+  const failureDetails = [];
+  const summaryLines = [];
+
+  suites.forEach(function (entry) {
+    const name = entry[0];
+    const fn = entry[1];
+    let rows;
+    try {
+      rows = fn();
+    } catch (e) {
+      totalFail++;
+      summaryLines.push('ERROR -- ' + name + ' threw: ' + e.message);
+      failureDetails.push(name + ': threw ' + e.message);
+      return;
+    }
+    let suitePass = 0, suiteFail = 0;
+    rows.forEach(function (line) {
+      if (line.indexOf('PASS') === 0) { suitePass++; totalPass++; }
+      else { suiteFail++; totalFail++; failureDetails.push(name + ': ' + line); }
+    });
+    summaryLines.push((suiteFail === 0 ? 'OK  ' : 'FAIL') + ' -- ' + name + ' (' + suitePass + ' pass, ' + suiteFail + ' fail)');
+  });
+
+  Logger.log('===== runAllTests summary =====');
+  Logger.log(summaryLines.join('\n'));
+  Logger.log('===== Totals: ' + totalPass + ' passed, ' + totalFail + ' failed =====');
+  if (failureDetails.length) {
+    Logger.log('===== Failure detail =====');
+    Logger.log(failureDetails.join('\n'));
+  }
 }
