@@ -228,47 +228,21 @@ function getSheet_(name) {
 // Cached (confirmed 2026-10-07) -- every list* action funnels through
 // this one function, and it previously did a full getDataRange().getValues()
 // read + a rowToObject_ pass (including JSON.parse-ing any JSON_FIELDS
-// blob in every row) on every single call, with no reuse across requests.
-// Under concurrent load (several of these firing at once on one page
-// load) that was slow enough to occasionally queue up behind Apps
-// Script's own execution concurrency limits and blow past the client's
-// timeout entirely -- see jsonpRequest's own fail()/reason comment. A
-// short TTL cache turns the common case (many reads of data that hasn't
-// changed in the last CACHE_TTL_SECONDS) into a cache hit instead of a
-// fresh sheet scan every time. Invalidated wholesale on every write (see
-// doPost) rather than tracked per-sheet, since several delete/cascade
-// paths mutate sheets directly rather than through the generic write
-// helpers below -- a missed per-sheet invalidation would mean stale data
-// silently visible to other users for the rest of the TTL, which is a
-// worse failure mode than the cost of over-invalidating on every write.
-const CACHE_TTL_SECONDS = 45;
-
+// blob in every row) on every single call. A 45s CacheService cache used
+// to wrap this (added when every entity still lived in Sheets, since
+// concurrent reads under load could queue up behind Apps Script's own
+// execution concurrency limits and blow past the client's timeout -- see
+// jsonpRequest's own fail()/reason comment), but every entity has since
+// been cut over to SQL Connect (confirmed 2026-10-08) -- readRows_ is now
+// only called by one-time migrateXToSql functions and a couple of
+// historical/diagnostic functions, none of which are on any live request
+// path, so the cache (and the matching per-write invalidation in doPost)
+// was removed 2026-10-13 as dead weight.
 function readRows_(sheetName) {
-  const cache = CacheService.getScriptCache();
-  const cacheKey = 'rows:' + sheetName;
-  const cached = cache.get(cacheKey);
-  if (cached) {
-    try {
-      return JSON.parse(cached);
-    } catch (e) {
-      // Fall through to a real read if the cached value is somehow corrupt.
-    }
-  }
-
   const sheet = getSheet_(sheetName);
   const data = sheet.getDataRange().getValues();
   const headers = data[0];
-  const rows = data.slice(1).map(function (row) { return rowToObject_(headers, row); });
-
-  try {
-    cache.put(cacheKey, JSON.stringify(rows), CACHE_TTL_SECONDS);
-  } catch (e) {
-    // CacheService caps a single value at 100KB -- a sheet with enough
-    // rows/large JSON_FIELDS blobs can exceed that. Skip caching this one
-    // rather than fail the read itself, which already succeeded above.
-  }
-
-  return rows;
+  return data.slice(1).map(function (row) { return rowToObject_(headers, row); });
 }
 
 // Fields that store a nested JS object as a JSON string in the sheet cell —
@@ -694,14 +668,6 @@ function doPost(e) {
   const values = e.parameter.payload ? JSON.parse(e.parameter.payload) : {};
   const now = new Date().toISOString();
 
-  // Every write invalidates every cached list wholesale (see readRows_'s
-  // own comment for why not per-sheet) -- done up front rather than at
-  // the end, since most action branches below return early and a
-  // post-write invalidation would need to be repeated in each one.
-  CacheService.getScriptCache().removeAll(
-    Object.values(SHEET_NAMES).map(function (name) { return 'rows:' + name; })
-  );
-
   if (action === 'createTag') {
     requireWrite_(user);
     values.id = values.id || Utilities.getUuid();
@@ -984,52 +950,11 @@ function migrateProjectFoldersIntoYearFolders() {
   return { moved: moved, skipped: skipped, failed: failed };
 }
 
-// One-time manual check (confirmed 2026-10-07; run from the Apps Script
-// editor's Run button, not exposed via doGet/doPost) -- confirms
-// readRows_'s new cache is actually producing a speedup, rather than
-// trusting the implementation without measuring it. Tests against
-// Versions (one of the two sheets with large packages JSON blobs) since
-// that's where the cache matters most; a small lookup sheet wouldn't
-// show a meaningful difference either way.
-function testReadRowsCachePerformance() {
-  const sheetName = SHEET_NAMES.versions;
-  CacheService.getScriptCache().remove('rows:' + sheetName); // force a cold start
-
-  const t0 = Date.now();
-  const coldRows = readRows_(sheetName);
-  const coldMs = Date.now() - t0;
-
-  const t1 = Date.now();
-  const warmRows = readRows_(sheetName);
-  const warmMs = Date.now() - t1;
-
-  Logger.log(
-    'Versions sheet (' + coldRows.length + ' rows): ' +
-    'cold read = ' + coldMs + 'ms, cached read = ' + warmMs + 'ms. ' +
-    'Row counts match: ' + (coldRows.length === warmRows.length)
-  );
-}
-
-// One-time manual check (confirmed 2026-10-07; run from the Apps Script
-// editor's Run button) -- measures actual current data size per sheet,
-// to ground a real "how long would Firestore's 1GB free tier last"
-// estimate instead of guessing. Measures raw JSON.stringify size; actual
-// Firestore storage runs somewhat higher than this due to per-document
-// field-name and index overhead, so treat this as a floor, not the
-// final number.
-function measureCurrentDataSize() {
-  const names = Object.values(SHEET_NAMES);
-  let totalBytes = 0;
-  const lines = [];
-  names.forEach(function (name) {
-    const rows = readRows_(name);
-    const bytes = Utilities.newBlob(JSON.stringify(rows)).getBytes().length;
-    totalBytes += bytes;
-    lines.push(name + ': ' + rows.length + ' rows, ' + (bytes / 1024).toFixed(1) + ' KB');
-  });
-  lines.push('TOTAL: ' + (totalBytes / 1024 / 1024).toFixed(2) + ' MB');
-  Logger.log(lines.join('\n'));
-}
+// testReadRowsCachePerformance (measured readRows_'s now-removed Sheets
+// cache) and measureCurrentDataSize (ground a Firestore-free-tier estimate
+// for a storage backend this project didn't end up choosing) were both
+// removed 2026-10-13 -- neither has had anything left to measure since the
+// SQL Connect migration completed.
 
 // Confirmed 2026-10-08: ScriptApp.getOAuthToken() represents the human user
 // running the script, not a service account -- and SQL Connect's
