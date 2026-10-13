@@ -1,9 +1,9 @@
-// Sandbox for the real Project/Version/User schema (§5 of
-// End-to-End-System-Plan.md). Read/write client pattern (JSONP reads,
-// iframe-POST-then-verify writes) is already proven against the
-// closed_deals pilot; this reuses it.
-//
-// Still not built: Projects/Plans Log derived views (weeks 6-8).
+// Media Planner backend -- Apps Script web app serving media-planner-tool
+// and media-planner-app. Storage is Postgres via Firebase SQL Connect
+// (migrated off Google Sheets entity-by-entity 2026-10-08, confirmed
+// complete via runAllTests()); Sheets remain only as an untouched,
+// read-only historical backup. Read/write client pattern (JSONP reads,
+// iframe-POST-then-verify writes) is shared by both frontends.
 
 const PARENT_FOLDER_ID = '1tCaf4LoB1qcARLK2faKN2yYTxXMW96lh'; // "Media Planner Projects"
 
@@ -170,7 +170,7 @@ function authorizeDriveAccess() {
 // Same reasoning as authorizeDriveAccess — run once from the editor's "Run"
 // button after adding MailApp/UrlFetchApp usage, to grant the new scopes.
 function authorizeMailAndFetchAccess() {
-  MailApp.sendEmail({ to: Session.getActiveUser().getEmail(), subject: 'Media Planner sandbox — authorization test', body: 'If you got this, MailApp is authorized.' });
+  MailApp.sendEmail({ to: Session.getActiveUser().getEmail(), subject: 'Media Planner backend — authorization test', body: 'If you got this, MailApp is authorized.' });
   Logger.log('Mail sent to ' + Session.getActiveUser().getEmail());
 }
 
