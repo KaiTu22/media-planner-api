@@ -136,10 +136,12 @@ const TAG_FIELDS = ['id', 'name', 'color', 'createdAt', 'createdBy'];
 const PROJECT_FILE_LINK_FIELDS = ['id', 'projectId', 'name', 'url', 'createdAt', 'createdBy'];
 
 // Same field names Supabase's closed_deals table already used (confirmed
-// 2026-09-16) — deliberately, so media-planner-tool's buildSupabaseDealRow()/
-// supabaseRowToDealShape() row-shape mapping works unchanged against this
-// sheet too, and the one-time historical migration (migrateClosedDealsFromSupabase)
-// is a straight copy, not a re-mapping.
+// 2026-09-16) — deliberately, so media-planner-tool's buildSupabaseDealRow()
+// row-shape mapping works unchanged against this sheet too. (The one-time
+// historical migration from Supabase that originally seeded this data has
+// since been removed -- confirmed 2026-10-12 it was never called again
+// after the 2026-09-16 backfill, and wrote to the now-unused Sheets tab,
+// not Postgres.)
 const CLOSED_DEAL_FIELDS = [
   'deal_id', 'project_id', 'version_id', 'project_name', 'brand_name', 'sub_brand_name',
   'agency_name', 'version_name', 'deal_category', 'tentpole_show_name', 'deal_status',
@@ -170,30 +172,6 @@ function authorizeDriveAccess() {
 function authorizeMailAndFetchAccess() {
   MailApp.sendEmail({ to: Session.getActiveUser().getEmail(), subject: 'Media Planner sandbox — authorization test', body: 'If you got this, MailApp is authorized.' });
   Logger.log('Mail sent to ' + Session.getActiveUser().getEmail());
-}
-
-// One-time historical backfill (2026-09-16) — run once from the Apps Script
-// editor after deploying the ClosedDeals sheet/actions. Pulls every row
-// currently in Supabase's closed_deals table (read-only against Supabase;
-// this sandbox never writes there) and upserts it into the new sheet, using
-// the exact same field names so no re-mapping is needed. Safe to re-run —
-// upsertClosedDeal-equivalent logic below updates in place by deal_id.
-// UrlFetchApp is already an authorized scope (see the Slack webhook call
-// above), so this shouldn't need a fresh consent screen.
-function migrateClosedDealsFromSupabase() {
-  const SUPABASE_URL = 'https://xybahqtnyviofvynljhw.supabase.co';
-  const SUPABASE_ANON_KEY = 'sb_publishable_klh9Ue6-vG4aQ3XpeFBQHg_0h5gGvsm';
-  const fields = CLOSED_DEAL_FIELDS.join(',');
-  const url = SUPABASE_URL + '/rest/v1/closed_deals?select=' + fields;
-  const response = UrlFetchApp.fetch(url, {
-    headers: { apikey: SUPABASE_ANON_KEY, Authorization: 'Bearer ' + SUPABASE_ANON_KEY },
-  });
-  const rows = JSON.parse(response.getContentText());
-  rows.forEach(function (row) {
-    const updated = updateRecord_(SHEET_NAMES.closedDeals, CLOSED_DEAL_FIELDS, 'deal_id', row.deal_id, row);
-    if (!updated) appendRecord_(SHEET_NAMES.closedDeals, CLOSED_DEAL_FIELDS, row);
-  });
-  Logger.log('Migrated ' + rows.length + ' closed deal(s) from Supabase.');
 }
 
 function setupSchema() {
@@ -401,71 +379,14 @@ function deleteRowByKey_(sheetName, fields, keyField, keyValue) {
   return false;
 }
 
-// Deletes every row in `sheetName` whose `foreignKeyField` equals `keyValue`
-// — unlike deleteRowByKey_ (first match only), for genuine child records
-// that shouldn't be orphaned when their parent is deleted (e.g. Season/Years
-// under a Show). Returns the deleted rows' own `id` values, so callers can
-// cascade further (e.g. clearing Project.seasonYearId for any project that
-// pointed at one of the now-deleted child rows).
-function deleteRowsByForeignKey_(sheetName, fields, foreignKeyField, keyValue) {
-  const sheet = getSheet_(sheetName);
-  const headers = ensureColumns_(sheet, fields);
-  const fkIdx = headers.indexOf(foreignKeyField);
-  const idIdx = headers.indexOf('id');
-  const data = sheet.getDataRange().getValues();
-  const deletedIds = [];
-  for (let r = data.length - 1; r >= 1; r--) {
-    if (data[r][fkIdx] === keyValue) {
-      deletedIds.push(data[r][idIdx]);
-      sheet.deleteRow(r + 1);
-    }
-  }
-  return deletedIds;
-}
-
-// Updates every row in `sheetName` whose `foreignKeyField` equals `oldValue`
-// to `newValue` (pass '' to clear/orphan rather than rename) — used when a
-// HoldCo/Pitch Team is renamed or deleted, so Agency/TeamRoster rows
-// referencing it by name don't silently point at a name that no longer
-// exists. Leaf rows themselves are never deleted by this — they just become
-// unassigned, same philosophy as deleteTag_ stripping a tag from projects
-// rather than deleting the projects.
-// Writes the whole column back in one setValues() call instead of one
-// setValue() round-trip per matching row (confirmed 2026-09-15) — the
-// per-row version held the shared script lock (see withLock_) for as long
-// as the sheet had matching rows, which could stall every OTHER concurrent
-// write (e.g. an unrelated "add Pitch Lead") behind it. Same failure mode
-// the 2026-09-04 fix eliminated for createProject's Drive folder creation,
-// just reintroduced here — this closes it the same way, by making the held
-// operation fast rather than moving it outside the lock.
-function cascadeForeignKey_(sheetName, fields, foreignKeyField, oldValue, newValue) {
-  const sheet = getSheet_(sheetName);
-  const headers = ensureColumns_(sheet, fields);
-  const colIdx = headers.indexOf(foreignKeyField);
-  const data = sheet.getDataRange().getValues();
-  if (data.length <= 1) return;
-  let changed = false;
-  const column = data.slice(1).map(function (row) {
-    if (row[colIdx] === oldValue) {
-      changed = true;
-      return [newValue];
-    }
-    return [row[colIdx]];
-  });
-  if (changed) {
-    sheet.getRange(2, colIdx + 1, column.length, 1).setValues(column);
-  }
-}
+// deleteRowsByForeignKey_/cascadeForeignKey_/lookupValue_ (the Sheets-backed
+// originals that deleteRowsByForeignKeySql_/cascadeForeignKeySql_/
+// lookupValueSql_ below were built as SQL-Connect-backed siblings of) were
+// removed 2026-10-13 once every entity finished its Phase 4 cutover and
+// the last live call site switched to its _Sql_ equivalent -- confirmed
+// via grep that nothing called the originals anymore.
 
 // §5.1 — pitchTeam and holdCo are lookup-derived, never manually typed.
-function lookupValue_(sheetName, keyField, key, valueField) {
-  if (!key) return null;
-  const rows = readRows_(sheetName);
-  const match = rows.find(function (r) { return r[keyField] === key; });
-  return match ? match[valueField] : null;
-}
-
-// cut over to SQL Connect 2026-10-08 (Phase 4) — sibling of lookupValue_ for entities already on SQL.
 function lookupValueSql_(sheetName, keyField, key, valueField) {
   if (!key) return null;
   const rows = readRowsSql_(sheetName);
@@ -615,8 +536,20 @@ function sendSlackNotification_(subject, lines, emails) {
 // Rejects a duplicate name (case-insensitive) rather than silently creating
 // a near-identical variant ("Priority" vs "priority") — the whole point of
 // a managed vocabulary over free-form tagging is avoiding this.
+//
+// cut over to SQL Connect 2026-10-08 (Phase 4, Tags first). The upfront
+// .some() check below is now just a fast-path UX nicety (catches the
+// common case without a round-trip to actually attempt the insert) --
+// the REAL guarantee against a race (two people creating the same tag
+// name at the same instant) is the `name @unique` index added to the Tag
+// table 2026-10-13, which Postgres enforces atomically regardless of
+// application-level timing. This is what let withLock_ be removed from
+// every write action: concurrent requests used to need a shared lock to
+// stay safe, since Sheets had no real transactions, but Postgres's own
+// primary keys (every other entity's natural key) and this one explicit
+// unique index (Tag.name is the only business-uniqueness rule that isn't
+// already a primary key) now provide that guarantee natively.
 function createTag_(values) {
-  // Cut over to SQL Connect 2026-10-08 (Phase 4, Tags first).
   const existing = readRowsSql_(SHEET_NAMES.tags);
   const name = (values.name || '').trim();
   if (!name) throw new Error('Tag name is required.');
@@ -624,7 +557,14 @@ function createTag_(values) {
     throw new Error('A tag named "' + name + '" already exists.');
   }
   const color = values.color || TAG_COLORS[existing.length % TAG_COLORS.length];
-  appendRecordSql_(SHEET_NAMES.tags, TAG_FIELDS, { id: values.id, name: name, color: color, createdAt: values.createdAt, createdBy: values.createdBy });
+  try {
+    appendRecordSql_(SHEET_NAMES.tags, TAG_FIELDS, { id: values.id, name: name, color: color, createdAt: values.createdAt, createdBy: values.createdBy });
+  } catch (e) {
+    if (e.dataConnectCode === 'ALREADY_EXISTS') {
+      throw new Error('A tag named "' + name + '" already exists.');
+    }
+    throw e;
+  }
 }
 
 // Cascades to Versions too (mirrors deleteTag_'s cascade philosophy) —
@@ -642,8 +582,7 @@ function deleteProject_(projectId) {
 
 // Removes a tag from the managed list and strips it from every project
 // that had it assigned, so nothing is left pointing at a name that no
-// longer exists in the vocabulary. Caller must hold the script lock (see
-// withLock_ in doPost) since this mutates two sheets.
+// longer exists in the vocabulary.
 function deleteTag_(tagId) {
   // cut over to SQL Connect 2026-10-08 (Phase 4) -- this is a per-row
   // conditional string edit (strip one value out of a comma-separated
@@ -719,25 +658,31 @@ function doGet(e) {
   return respond_(result, callback);
 }
 
-// Holds the script lock only around the actual sheet mutation, not around
-// slow unrelated I/O (Drive folder creation, lookups, notifications).
-// Confirmed 2026-09-04 by a real concurrency test: holding the lock across
-// createProject's full body (including Drive folder creation) meant a
-// queue of concurrent writes serialized through that slow step too, and
-// 2 of 10 concurrent test writes timed out waiting for the lock and were
+// withLock_ (a single LockService.getScriptLock() wrapped around every
+// write action) was removed entirely 2026-10-13. History: originally
+// needed because Sheets has no real transactions -- a lock was the only
+// way to prevent two concurrent writes from corrupting each other.
+// Confirmed 2026-09-04 by a real concurrency test that narrowing the
+// lock's scope (holding it only around the sheet mutation, not around
+// slow I/O like Drive folder creation) wasn't enough on its own: 2 of 10
+// concurrent test writes still timed out waiting for the lock and were
 // silently lost (waitLock() throws outside try/finally, and doPost's
-// response is unreadable anyway — see comment below). Narrowing the lock
-// to just the sheet write keeps hold time to milliseconds, so far more
-// concurrent writers can be served within the same timeout.
-function withLock_(fn) {
-  const lock = LockService.getScriptLock();
-  lock.waitLock(30000);
-  try {
-    fn();
-  } finally {
-    lock.releaseLock();
-  }
-}
+// response is unreadable anyway -- see comment below), since every write
+// for every entity, for every user, still serialized through the one
+// shared lock. Confirmed again 2026-10-13 under a 20-concurrent-write
+// test (20 simultaneous createTag calls): individual writes took up to
+// 15s to drain through the queue, with zero client-side indication of
+// how long a save would actually take before the UI falsely reported
+// success. Removed once Postgres's own guarantees made it unnecessary:
+// every entity's natural key is already a real Postgres primary key
+// (HoldCo/PitchTeam/AgencyHoldCo/TeamRoster/User/ClosedDeal by name/email/
+// dealId, everything else by a generated id) except Tag.name, which
+// isn't itself the primary key -- so a `name @unique` index was added to
+// the Tag table specifically to cover that one case, and createTag_ now
+// catches the resulting ALREADY_EXISTS error as the real race-safety
+// backstop (see its own comment). This lets unrelated writes from
+// different team members execute in true parallel instead of queuing
+// behind each other.
 
 // Response body is unreadable cross-origin (script.google.com sends
 // X-Frame-Options: sameorigin, blocking any iframe response including
@@ -762,42 +707,30 @@ function doPost(e) {
     values.id = values.id || Utilities.getUuid();
     values.createdAt = now;
     values.createdBy = user.email;
-    withLock_(function () {
-      createTag_(values);
-    });
+    createTag_(values);
     return ContentService.createTextOutput('ok').setMimeType(ContentService.MimeType.TEXT);
   } else if (action === 'deleteTag') {
     requireWrite_(user);
-    withLock_(function () {
-      deleteTag_(values.id);
-    });
+    deleteTag_(values.id);
     return ContentService.createTextOutput('ok').setMimeType(ContentService.MimeType.TEXT);
   } else if (action === 'updateTag') {
     requireWrite_(user);
-    withLock_(function () {
-      updateRecordSql_(SHEET_NAMES.tags, TAG_FIELDS, 'id', values.id, values); // cut over to SQL Connect 2026-10-08 (Phase 4, Tags first)
-    });
+    updateRecordSql_(SHEET_NAMES.tags, TAG_FIELDS, 'id', values.id, values); // cut over to SQL Connect 2026-10-08 (Phase 4, Tags first)
     return ContentService.createTextOutput('ok').setMimeType(ContentService.MimeType.TEXT);
   } else if (action === 'deleteProject') {
     requireWrite_(user);
-    withLock_(function () {
-      deleteProject_(values.id);
-    });
+    deleteProject_(values.id);
     return ContentService.createTextOutput('ok').setMimeType(ContentService.MimeType.TEXT);
   } else if (action === 'addProjectFileLink') {
     requireWrite_(user);
     values.id = values.id || Utilities.getUuid();
     values.createdAt = now;
     values.createdBy = user.email;
-    withLock_(function () {
-      appendRecordSql_(SHEET_NAMES.projectFileLinks, PROJECT_FILE_LINK_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    appendRecordSql_(SHEET_NAMES.projectFileLinks, PROJECT_FILE_LINK_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
     return ContentService.createTextOutput('ok').setMimeType(ContentService.MimeType.TEXT);
   } else if (action === 'deleteProjectFileLink') {
     requireWrite_(user);
-    withLock_(function () {
-      deleteRowByKeySql_(SHEET_NAMES.projectFileLinks, PROJECT_FILE_LINK_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    deleteRowByKeySql_(SHEET_NAMES.projectFileLinks, PROJECT_FILE_LINK_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
     return ContentService.createTextOutput('ok').setMimeType(ContentService.MimeType.TEXT);
   } else if (action === 'uploadProjectAttachment') {
     requireWrite_(user);
@@ -819,9 +752,7 @@ function doPost(e) {
     values.updatedBy = user.email;
     applyProjectLookups_(values); // reads TeamRoster/AgencyHoldCo — different sheets, no lock needed
     createProjectFolder_(values); // Drive API call — slow, no shared-sheet state, no lock needed
-    withLock_(function () {
-      appendRecordSql_(SHEET_NAMES.projects, PROJECT_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    appendRecordSql_(SHEET_NAMES.projects, PROJECT_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
     try {
       sendAssignmentNotifications_(values);
     } catch (e) {
@@ -832,9 +763,7 @@ function doPost(e) {
     values.updatedAt = now;
     values.updatedBy = user.email;
     applyProjectLookups_(values);
-    withLock_(function () {
-      updateRecordSql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'id', values.id, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    updateRecordSql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'id', values.id, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'createVersion') {
     requireWrite_(user);
     values.id = values.id || Utilities.getUuid();
@@ -842,103 +771,69 @@ function doPost(e) {
     values.createdBy = user.email;
     values.updatedAt = now;
     values.updatedBy = user.email;
-    withLock_(function () {
-      appendRecordSql_(SHEET_NAMES.versions, VERSION_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    appendRecordSql_(SHEET_NAMES.versions, VERSION_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'updateVersion') {
     requireWrite_(user);
     values.updatedAt = now;
     values.updatedBy = user.email;
-    withLock_(function () {
-      updateRecordSql_(SHEET_NAMES.versions, VERSION_FIELDS, 'id', values.id, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    updateRecordSql_(SHEET_NAMES.versions, VERSION_FIELDS, 'id', values.id, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'deleteVersion') {
     requireWrite_(user);
-    withLock_(function () {
-      deleteRowByKeySql_(SHEET_NAMES.versions, VERSION_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    deleteRowByKeySql_(SHEET_NAMES.versions, VERSION_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'createTeamRosterEntry') {
     requireWrite_(user);
-    withLock_(function () {
-      appendRecordSql_(SHEET_NAMES.teamRoster, TEAM_ROSTER_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    appendRecordSql_(SHEET_NAMES.teamRoster, TEAM_ROSTER_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'createAgencyHoldCoEntry') {
     requireWrite_(user);
-    withLock_(function () {
-      appendRecordSql_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    appendRecordSql_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'updateTeamRosterEntry') {
     requireWrite_(user);
-    withLock_(function () {
-      updateRecordSql_(SHEET_NAMES.teamRoster, TEAM_ROSTER_FIELDS, 'teamMemberName', values.teamMemberName, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    updateRecordSql_(SHEET_NAMES.teamRoster, TEAM_ROSTER_FIELDS, 'teamMemberName', values.teamMemberName, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'deleteTeamRosterEntry') {
     requireWrite_(user);
-    withLock_(function () {
-      deleteRowByKeySql_(SHEET_NAMES.teamRoster, TEAM_ROSTER_FIELDS, 'teamMemberName', values.teamMemberName); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    deleteRowByKeySql_(SHEET_NAMES.teamRoster, TEAM_ROSTER_FIELDS, 'teamMemberName', values.teamMemberName); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'updateAgencyHoldCoEntry') {
     requireWrite_(user);
-    withLock_(function () {
-      updateRecordSql_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, 'agency', values.agency, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    updateRecordSql_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, 'agency', values.agency, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'renameAgency') {
     // payload: { originalName, name } — originalName locates the row, name
     // is the new agency text, cascaded into every Project that referenced
     // the old name (same pattern as updateHoldCo below).
     requireWrite_(user);
-    withLock_(function () {
-      updateRecordSql_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, 'agency', values.originalName, { agency: values.name }); // cut over to SQL Connect 2026-10-08 (Phase 4)
-      cascadeForeignKeySql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'agency', values.originalName, values.name); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    updateRecordSql_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, 'agency', values.originalName, { agency: values.name }); // cut over to SQL Connect 2026-10-08 (Phase 4)
+    cascadeForeignKeySql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'agency', values.originalName, values.name); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'deleteAgencyHoldCoEntry') {
     requireWrite_(user);
-    withLock_(function () {
-      deleteRowByKeySql_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, 'agency', values.agency); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    deleteRowByKeySql_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, 'agency', values.agency); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'createHoldCo') {
     requireWrite_(user);
-    withLock_(function () {
-      appendRecordSql_(SHEET_NAMES.holdCos, HOLDCO_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    appendRecordSql_(SHEET_NAMES.holdCos, HOLDCO_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'updateHoldCo') {
     // payload: { originalName, name } — originalName locates the row,
     // name is the (possibly unchanged) new value, cascaded into every
     // AgencyHoldCo row that referenced the old name.
     requireWrite_(user);
-    withLock_(function () {
-      updateRecordSql_(SHEET_NAMES.holdCos, HOLDCO_FIELDS, 'name', values.originalName, { name: values.name }); // cut over to SQL Connect 2026-10-08 (Phase 4)
-      cascadeForeignKeySql_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, 'holdCo', values.originalName, values.name); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    updateRecordSql_(SHEET_NAMES.holdCos, HOLDCO_FIELDS, 'name', values.originalName, { name: values.name }); // cut over to SQL Connect 2026-10-08 (Phase 4)
+    cascadeForeignKeySql_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, 'holdCo', values.originalName, values.name); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'deleteHoldCo') {
     requireWrite_(user);
-    withLock_(function () {
-      deleteRowByKeySql_(SHEET_NAMES.holdCos, HOLDCO_FIELDS, 'name', values.name); // cut over to SQL Connect 2026-10-08 (Phase 4)
-      cascadeForeignKeySql_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, 'holdCo', values.name, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    deleteRowByKeySql_(SHEET_NAMES.holdCos, HOLDCO_FIELDS, 'name', values.name); // cut over to SQL Connect 2026-10-08 (Phase 4)
+    cascadeForeignKeySql_(SHEET_NAMES.agencyHoldCo, AGENCY_HOLDCO_FIELDS, 'holdCo', values.name, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'createPitchTeam') {
     requireWrite_(user);
-    withLock_(function () {
-      appendRecordSql_(SHEET_NAMES.pitchTeams, PITCH_TEAM_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    appendRecordSql_(SHEET_NAMES.pitchTeams, PITCH_TEAM_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'updatePitchTeam') {
     requireWrite_(user);
-    withLock_(function () {
-      updateRecordSql_(SHEET_NAMES.pitchTeams, PITCH_TEAM_FIELDS, 'name', values.originalName, { name: values.name }); // cut over to SQL Connect 2026-10-08 (Phase 4)
-      cascadeForeignKeySql_(SHEET_NAMES.teamRoster, TEAM_ROSTER_FIELDS, 'pitchTeam', values.originalName, values.name); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    updateRecordSql_(SHEET_NAMES.pitchTeams, PITCH_TEAM_FIELDS, 'name', values.originalName, { name: values.name }); // cut over to SQL Connect 2026-10-08 (Phase 4)
+    cascadeForeignKeySql_(SHEET_NAMES.teamRoster, TEAM_ROSTER_FIELDS, 'pitchTeam', values.originalName, values.name); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'deletePitchTeam') {
     requireWrite_(user);
-    withLock_(function () {
-      deleteRowByKeySql_(SHEET_NAMES.pitchTeams, PITCH_TEAM_FIELDS, 'name', values.name); // cut over to SQL Connect 2026-10-08 (Phase 4)
-      cascadeForeignKeySql_(SHEET_NAMES.teamRoster, TEAM_ROSTER_FIELDS, 'pitchTeam', values.name, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    deleteRowByKeySql_(SHEET_NAMES.pitchTeams, PITCH_TEAM_FIELDS, 'name', values.name); // cut over to SQL Connect 2026-10-08 (Phase 4)
+    cascadeForeignKeySql_(SHEET_NAMES.teamRoster, TEAM_ROSTER_FIELDS, 'pitchTeam', values.name, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'createUser') {
     requireWrite_(user);
     values.role = values.role || 'read';
-    withLock_(function () {
-      appendRecordSql_(SHEET_NAMES.users, USER_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    appendRecordSql_(SHEET_NAMES.users, USER_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'updateUser') {
     // payload: { originalEmail, email, name, role? } — role is optional so a
     // plain name/email edit never accidentally touches it; only sent when
@@ -948,43 +843,31 @@ function doPost(e) {
     requireWrite_(user);
     const patch = { email: values.email, name: values.name };
     if (values.role) patch.role = values.role;
-    withLock_(function () {
-      updateRecordSql_(SHEET_NAMES.users, USER_FIELDS, 'email', values.originalEmail, patch); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    updateRecordSql_(SHEET_NAMES.users, USER_FIELDS, 'email', values.originalEmail, patch); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'deleteUser') {
     requireWrite_(user);
-    withLock_(function () {
-      deleteRowByKeySql_(SHEET_NAMES.users, USER_FIELDS, 'email', values.email); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    deleteRowByKeySql_(SHEET_NAMES.users, USER_FIELDS, 'email', values.email); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'upsertClosedDeal') {
     // Mirrors Supabase's .upsert(row, {onConflict:'deal_id'}) semantics using
     // pieces that already exist — update in place if the deal_id is already
     // known, otherwise append a new row.
     requireWrite_(user);
-    withLock_(function () {
-      // cut over to SQL Connect 2026-10-08 (Phase 4)
-      const updated = updateRecordSql_(SHEET_NAMES.closedDeals, CLOSED_DEAL_FIELDS, 'deal_id', values.deal_id, values);
-      if (!updated) appendRecordSql_(SHEET_NAMES.closedDeals, CLOSED_DEAL_FIELDS, values);
-    });
+    // cut over to SQL Connect 2026-10-08 (Phase 4)
+    const updated = updateRecordSql_(SHEET_NAMES.closedDeals, CLOSED_DEAL_FIELDS, 'deal_id', values.deal_id, values);
+    if (!updated) appendRecordSql_(SHEET_NAMES.closedDeals, CLOSED_DEAL_FIELDS, values);
   } else if (action === 'deleteClosedDeal') {
     requireWrite_(user);
-    withLock_(function () {
-      deleteRowByKeySql_(SHEET_NAMES.closedDeals, CLOSED_DEAL_FIELDS, 'deal_id', values.deal_id); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    deleteRowByKeySql_(SHEET_NAMES.closedDeals, CLOSED_DEAL_FIELDS, 'deal_id', values.deal_id); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'createTentpoleShow') {
     requireWrite_(user);
     values.id = values.id || Utilities.getUuid();
-    withLock_(function () {
-      appendRecordSql_(SHEET_NAMES.tentpoleShows, TENTPOLE_SHOW_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    appendRecordSql_(SHEET_NAMES.tentpoleShows, TENTPOLE_SHOW_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'updateTentpoleShow') {
     // Keyed on the synthetic id (like Tags), not the name — renaming never
     // needs an old/new-key distinction the way HoldCo/PitchTeam's
     // natural-key rename does.
     requireWrite_(user);
-    withLock_(function () {
-      updateRecordSql_(SHEET_NAMES.tentpoleShows, TENTPOLE_SHOW_FIELDS, 'id', values.id, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    updateRecordSql_(SHEET_NAMES.tentpoleShows, TENTPOLE_SHOW_FIELDS, 'id', values.id, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'deleteTentpoleShow') {
     // Projects referencing this show keep their tentpoleShowId cleared, not
     // the project itself deleted — same non-destructive cascade philosophy
@@ -994,40 +877,32 @@ function doPost(e) {
     // pointing at one of them has its seasonYearId cleared the same way
     // tentpoleShowId is below.
     requireWrite_(user);
-    withLock_(function () {
-      const deletedSeasonYearIds = deleteRowsByForeignKeySql_(SHEET_NAMES.seasonYears, SEASON_YEAR_FIELDS, 'showId', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
-      deletedSeasonYearIds.forEach(function (seasonYearId) {
-        cascadeForeignKeySql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'seasonYearId', seasonYearId, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
-        cascadeForeignKeySql_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'seasonYearId', seasonYearId, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
-      });
-      deleteRowByKeySql_(SHEET_NAMES.tentpoleShows, TENTPOLE_SHOW_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
-      cascadeForeignKeySql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'tentpoleShowId', values.id, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
-      // Sponsorship Hub packages are real built inventory, not a soft
-      // reference — orphan (clear showId), never cascade-delete the
-      // package itself just because its Show went away.
-      cascadeForeignKeySql_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'showId', values.id, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
+    const deletedSeasonYearIds = deleteRowsByForeignKeySql_(SHEET_NAMES.seasonYears, SEASON_YEAR_FIELDS, 'showId', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
+    deletedSeasonYearIds.forEach(function (seasonYearId) {
+      cascadeForeignKeySql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'seasonYearId', seasonYearId, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
+      cascadeForeignKeySql_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'seasonYearId', seasonYearId, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
     });
+    deleteRowByKeySql_(SHEET_NAMES.tentpoleShows, TENTPOLE_SHOW_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
+    cascadeForeignKeySql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'tentpoleShowId', values.id, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
+    // Sponsorship Hub packages are real built inventory, not a soft
+    // reference — orphan (clear showId), never cascade-delete the
+    // package itself just because its Show went away.
+    cascadeForeignKeySql_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'showId', values.id, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'createSeasonYear') {
     requireWrite_(user);
     values.id = values.id || Utilities.getUuid();
-    withLock_(function () {
-      appendRecordSql_(SHEET_NAMES.seasonYears, SEASON_YEAR_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    appendRecordSql_(SHEET_NAMES.seasonYears, SEASON_YEAR_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'updateSeasonYear') {
     requireWrite_(user);
-    withLock_(function () {
-      updateRecordSql_(SHEET_NAMES.seasonYears, SEASON_YEAR_FIELDS, 'id', values.id, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    updateRecordSql_(SHEET_NAMES.seasonYears, SEASON_YEAR_FIELDS, 'id', values.id, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'deleteSeasonYear') {
     // Projects and Sponsorship Hub packages referencing this season/year
     // keep it cleared, not deleted — same non-destructive cascade as
     // tentpoleShowId.
     requireWrite_(user);
-    withLock_(function () {
-      deleteRowByKeySql_(SHEET_NAMES.seasonYears, SEASON_YEAR_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
-      cascadeForeignKeySql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'seasonYearId', values.id, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
-      cascadeForeignKeySql_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'seasonYearId', values.id, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    deleteRowByKeySql_(SHEET_NAMES.seasonYears, SEASON_YEAR_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
+    cascadeForeignKeySql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'seasonYearId', values.id, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
+    cascadeForeignKeySql_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'seasonYearId', values.id, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'createSponsorshipPackage') {
     requireWrite_(user);
     values.id = values.id || Utilities.getUuid();
@@ -1036,57 +911,39 @@ function doPost(e) {
     values.createdBy = user.email;
     values.updatedAt = now;
     values.updatedBy = user.email;
-    withLock_(function () {
-      appendRecordSql_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    appendRecordSql_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'updateSponsorshipPackage') {
     requireWrite_(user);
     values.updatedAt = now;
     values.updatedBy = user.email;
-    withLock_(function () {
-      updateRecordSql_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'id', values.id, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    updateRecordSql_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'id', values.id, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'deleteSponsorshipPackage') {
     requireWrite_(user);
-    withLock_(function () {
-      deleteRowByKeySql_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    deleteRowByKeySql_(SHEET_NAMES.sponsorshipPackages, SPONSORSHIP_PACKAGE_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'createPlacementCategory') {
     requireWrite_(user);
     values.id = values.id || Utilities.getUuid();
-    withLock_(function () {
-      appendRecordSql_(SHEET_NAMES.placementCategories, PLACEMENT_CATEGORY_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    appendRecordSql_(SHEET_NAMES.placementCategories, PLACEMENT_CATEGORY_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'updatePlacementCategory') {
     requireWrite_(user);
-    withLock_(function () {
-      updateRecordSql_(SHEET_NAMES.placementCategories, PLACEMENT_CATEGORY_FIELDS, 'id', values.id, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    updateRecordSql_(SHEET_NAMES.placementCategories, PLACEMENT_CATEGORY_FIELDS, 'id', values.id, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'deletePlacementCategory') {
     // Menu items are genuine children of a category (same reasoning as
     // Season/Year under Show) — deleted outright, not orphaned, since a
     // menu item with no category has nowhere to appear in the picker.
     requireWrite_(user);
-    withLock_(function () {
-      deleteRowsByForeignKeySql_(SHEET_NAMES.placementMenuItems, PLACEMENT_MENU_ITEM_FIELDS, 'categoryId', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
-      deleteRowByKeySql_(SHEET_NAMES.placementCategories, PLACEMENT_CATEGORY_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    deleteRowsByForeignKeySql_(SHEET_NAMES.placementMenuItems, PLACEMENT_MENU_ITEM_FIELDS, 'categoryId', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
+    deleteRowByKeySql_(SHEET_NAMES.placementCategories, PLACEMENT_CATEGORY_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'createPlacementMenuItem') {
     requireWrite_(user);
     values.id = values.id || Utilities.getUuid();
-    withLock_(function () {
-      appendRecordSql_(SHEET_NAMES.placementMenuItems, PLACEMENT_MENU_ITEM_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    appendRecordSql_(SHEET_NAMES.placementMenuItems, PLACEMENT_MENU_ITEM_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'updatePlacementMenuItem') {
     requireWrite_(user);
-    withLock_(function () {
-      updateRecordSql_(SHEET_NAMES.placementMenuItems, PLACEMENT_MENU_ITEM_FIELDS, 'id', values.id, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    updateRecordSql_(SHEET_NAMES.placementMenuItems, PLACEMENT_MENU_ITEM_FIELDS, 'id', values.id, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'deletePlacementMenuItem') {
     requireWrite_(user);
-    withLock_(function () {
-      deleteRowByKeySql_(SHEET_NAMES.placementMenuItems, PLACEMENT_MENU_ITEM_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
-    });
+    deleteRowByKeySql_(SHEET_NAMES.placementMenuItems, PLACEMENT_MENU_ITEM_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
   }
 
   return ContentService.createTextOutput('ok').setMimeType(ContentService.MimeType.TEXT);
@@ -1751,7 +1608,12 @@ function executeDataConnect_(operationName, variables, _isRetry) {
     throw new Error('Data Connect returned a non-JSON response (HTTP ' + status + ') for ' + operationName + ': ' + text.slice(0, 200));
   }
   if (body.errors) {
-    throw new Error('Data Connect error in ' + operationName + ': ' + JSON.stringify(body.errors));
+    const err = new Error('Data Connect error in ' + operationName + ': ' + JSON.stringify(body.errors));
+    // Structured code (e.g. 'ALREADY_EXISTS' for a unique-constraint
+    // violation, confirmed 2026-10-13) attached separately so callers can
+    // react to a specific failure class without parsing the message string.
+    err.dataConnectCode = body.errors[0] && body.errors[0].extensions && body.errors[0].extensions.code;
+    throw err;
   }
   return body.data;
 }
@@ -2012,9 +1874,8 @@ function testSqlStorageLayer() {
 // editor's Run button) -- Phase 4 cutover verification for Tags. Calls
 // doGet/doPost directly with a constructed event object (the most
 // faithful pre-deploy test available -- exercises the real action
-// dispatch, requireWrite_, withLock_, and createTag_'s own validation
-// logic, not just the generic SQL helpers testSqlStorageLayer already
-// covered).
+// dispatch, requireWrite_, and createTag_'s own validation logic, not
+// just the generic SQL helpers testSqlStorageLayer already covered).
 function testTagsCutover() {
   const results = [];
   function check(label, actual, expected) {
@@ -2560,7 +2421,10 @@ function testProjectFileLinksCutover() {
   }
 
   const projectId = 'cutover-test-project-' + Utilities.getUuid();
-  appendRecord_(SHEET_NAMES.projects, PROJECT_FIELDS, { id: projectId, projectName: 'Cutover Test Project' });
+  // Projects is SQL-backed now (it wasn't yet when this test was first
+  // written) -- appendRecordSql_ here, not appendRecord_, so this fixture
+  // row lives in the same store deleteProject_ actually deletes from below.
+  appendRecordSql_(SHEET_NAMES.projects, PROJECT_FIELDS, { id: projectId, projectName: 'Cutover Test Project' });
 
   const linkId = Utilities.getUuid();
   doPost({ parameter: { action: 'addProjectFileLink', payload: JSON.stringify({ id: linkId, projectId: projectId, name: 'Test Link', url: 'https://example.com' }) } });

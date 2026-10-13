@@ -26,7 +26,7 @@ type User @table(key: "email") {
 
 type Tag @table {
   id: String! @col(name: "id")
-  name: String
+  name: String @unique
   color: String
   createdAt: Timestamp
   createdBy: String
