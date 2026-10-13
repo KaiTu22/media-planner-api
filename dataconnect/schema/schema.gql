@@ -1,4 +1,4 @@
-# Schema for the media-planner-sandbox backend migration (Sheets -> Postgres
+# Schema for the media-planner-api backend migration (Sheets -> Postgres
 # via SQL Connect), confirmed 2026-10-08. Mirrors the field lists in Code.gs
 # as closely as possible -- same field names/types, same plain-string foreign
 # keys (tentpoleShowId, projectId, etc. stay as plain String columns, not
