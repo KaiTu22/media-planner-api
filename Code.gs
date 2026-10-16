@@ -1595,10 +1595,27 @@ DC_ENTITY_[SHEET_NAMES.closedDeals] = { type: 'closedDeal', listOp: 'ListClosedD
 // columns in Postgres (deliberately not normalized into child tables yet,
 // see schema.gql's own header comment), so the same stringify-on-write/
 // parse-on-read behavior must be preserved exactly.
+// Every non-String column in schema.gql (Date/Timestamp/Float, all
+// nullable). Confirmed 2026-10-16: the web form sends an untouched date
+// input as "", which Sheets happily stored but Postgres's Date type
+// rejects outright ("$planDueDate is invalid Date: string \"\" is not in
+// YYYY-MM-DD format") -- failing the whole createProject. Blank means
+// "no value" for these, so it's sent as null. String columns are left
+// alone: the frontends read "" back and call .trim() etc. on it.
+const DC_NON_STRING_FIELDS_ = [
+  'planRequestDate', 'planDueDate', 'campaignStartDate', 'campaignEndDate', 'completedDate',
+  'createdAt', 'updatedAt', 'verifiedAt', 'markedClosedAt', 'verified_at', 'marked_closed_at', 'updated_at',
+  'sharedRate', 'totalInvestment', 'totalMarginPercent', 'total_investment', 'total_margin_percent',
+];
+
 function dcStringifyJsonFields_(values) {
   const out = {};
   Object.keys(values).forEach(function (k) {
     const v = values[k];
+    if (DC_NON_STRING_FIELDS_.includes(k) && v === '') {
+      out[k] = null;
+      return;
+    }
     out[k] = (JSON_FIELDS.includes(k) && v && typeof v === 'object') ? JSON.stringify(v) : v;
   });
   return out;
@@ -2489,6 +2506,18 @@ function testProjectsCutover() {
   appendRecordSql_(SHEET_NAMES.projects, PROJECT_FIELDS, { id: projectId, projectName: 'Cutover Test Project', agency: 'Cutover Test Agency Untouched', tags: 'Alpha,Beta' });
   let list = JSON.parse(doGet({ parameter: { action: 'listProjects' } }).getContent());
   check('Project appears via doGet(listProjects) after appendRecordSql_', list.some(function (p) { return p.id === projectId; }), true);
+
+  // Confirmed 2026-10-16 bug: the web form sends untouched date inputs as
+  // "", which Postgres's Date type rejected, failing the whole create.
+  const blankDatesId = 'cutover-test-project-' + Utilities.getUuid();
+  appendRecordSql_(SHEET_NAMES.projects, PROJECT_FIELDS, { id: blankDatesId, projectName: 'Blank Dates Test', planRequestDate: '', planDueDate: '', campaignStartDate: '', campaignEndDate: '' });
+  updateRecordSql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'id', blankDatesId, { id: blankDatesId, planDueDate: '2026-11-01' });
+  updateRecordSql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'id', blankDatesId, { id: blankDatesId, planDueDate: '' });
+  list = JSON.parse(doGet({ parameter: { action: 'listProjects' } }).getContent());
+  const blankDates = list.find(function (p) { return p.id === blankDatesId; });
+  check('Project with blank dates is created (blank dates sent as null)', !!blankDates, true);
+  check('Project date cleared back to blank via update', blankDates ? !blankDates.planDueDate : null, true);
+  deleteRowByKeySql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'id', blankDatesId);
 
   doPost({ parameter: { action: 'updateProject', payload: JSON.stringify({ id: projectId, projectName: 'Cutover Test Project Renamed' }) } });
   list = JSON.parse(doGet({ parameter: { action: 'listProjects' } }).getContent());
