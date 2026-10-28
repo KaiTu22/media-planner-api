@@ -1608,12 +1608,22 @@ const DC_NON_STRING_FIELDS_ = [
   'sharedRate', 'totalInvestment', 'totalMarginPercent', 'total_investment', 'total_margin_percent',
 ];
 
+// Date (day-only) columns. Confirmed 2026-10-28: the planner tool sent
+// completedDate as a full ISO timestamp, which Postgres's Date type
+// rejects -- trimmed to its YYYY-MM-DD day here so any caller doing the
+// same still saves.
+const DC_DATE_FIELDS_ = ['planRequestDate', 'planDueDate', 'campaignStartDate', 'campaignEndDate', 'completedDate'];
+
 function dcStringifyJsonFields_(values) {
   const out = {};
   Object.keys(values).forEach(function (k) {
     const v = values[k];
     if (DC_NON_STRING_FIELDS_.includes(k) && v === '') {
       out[k] = null;
+      return;
+    }
+    if (DC_DATE_FIELDS_.includes(k) && typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(v)) {
+      out[k] = v.slice(0, 10);
       return;
     }
     out[k] = (JSON_FIELDS.includes(k) && v && typeof v === 'object') ? JSON.stringify(v) : v;
@@ -2613,6 +2623,12 @@ function testVersionsCutover() {
   doPost({ parameter: { action: 'updateVersion', payload: JSON.stringify({ id: versionId, name: 'v1 Renamed' }) } });
   list = JSON.parse(doGet({ parameter: { action: 'listVersions' } }).getContent());
   check('Version renamed via doPost(updateVersion)', list.find(function (v) { return v.id === versionId; }).name, 'v1 Renamed');
+
+  // Confirmed 2026-10-28 bug: Mark Complete sent a full ISO timestamp,
+  // which the Date column rejected.
+  doPost({ parameter: { action: 'updateVersion', payload: JSON.stringify({ id: versionId, completedDate: '2026-10-28T19:04:11.123Z' }) } });
+  list = JSON.parse(doGet({ parameter: { action: 'listVersions' } }).getContent());
+  check('Version completedDate sent as a full timestamp saves as its day', list.find(function (v) { return v.id === versionId; }).completedDate, '2026-10-28');
 
   const versionId2 = Utilities.getUuid();
   doPost({ parameter: { action: 'createVersion', payload: JSON.stringify({ id: versionId2, projectId: projectId, name: 'v2' }) } });
