@@ -589,7 +589,10 @@ function doGet(e) {
   const callback = e.parameter.callback;
   let result;
   try {
-    if (action === 'listProjectFiles') {
+    if (action === 'recentErrors') {
+      requireWrite_(getCurrentUser_());
+      result = readRecentErrors_();
+    } else if (action === 'listProjectFiles') {
       result = listProjectFiles_(e.parameter.projectId);
     } else if (action === 'listProjectFileLinks') {
       result = readRowsSql_(SHEET_NAMES.projectFileLinks).filter(function (r) { return r.projectId === e.parameter.projectId; }); // cut over to SQL Connect 2026-10-08 (Phase 4)
@@ -662,7 +665,61 @@ function doGet(e) {
 // X-Frame-Options: sameorigin, blocking any iframe response including
 // postMessage — confirmed against the closed_deals pilot). Callers must
 // verify writes via a follow-up doGet read, not this response.
+// The Executions panel doesn't show doPost's error text (confirmed
+// 2026-10-28: failed planner syncs showed only "Failed", with no way to
+// expand them), and the browser never sees doPost's response either (see
+// media-planner-app's appsScriptPost comment). So failures are recorded
+// here -- last 20, in CacheService only, never the database -- and read
+// back via doGet's recentErrors action (write users only).
+const RECENT_ERRORS_KEY_ = 'recentErrors';
+const RECENT_ERRORS_MAX_ = 20;
+
 function doPost(e) {
+  try {
+    return doPostImpl_(e);
+  } catch (err) {
+    try {
+      recordRecentError_(e, err);
+    } catch (ignored) {
+      // Never let error recording mask the real error.
+    }
+    throw err;
+  }
+}
+
+function recordRecentError_(e, err) {
+  const params = (e && e.parameter) || {};
+  let email = '';
+  try { email = Session.getActiveUser().getEmail(); } catch (ignored) {}
+  let id = '';
+  try { id = params.payload ? (JSON.parse(params.payload).id || '') : (params.projectId || ''); } catch (ignored) {}
+  const entry = {
+    at: new Date().toISOString(),
+    user: email,
+    action: params.action || '',
+    id: id,
+    payloadChars: (params.payload || params.content || '').length,
+    error: String((err && err.message) || err).slice(0, 2000),
+  };
+  const lock = LockService.getScriptLock();
+  lock.waitLock(5000);
+  try {
+    const cache = CacheService.getScriptCache();
+    let list = [];
+    try { list = JSON.parse(cache.get(RECENT_ERRORS_KEY_) || '[]'); } catch (ignored) {}
+    list.unshift(entry);
+    cache.put(RECENT_ERRORS_KEY_, JSON.stringify(list.slice(0, RECENT_ERRORS_MAX_)), 21600); // 6h, CacheService's max
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function readRecentErrors_() {
+  try { return JSON.parse(CacheService.getScriptCache().get(RECENT_ERRORS_KEY_) || '[]'); }
+  catch (e) { return []; }
+}
+
+function doPostImpl_(e) {
   const action = e.parameter.action;
   const user = getCurrentUser_();
   const values = e.parameter.payload ? JSON.parse(e.parameter.payload) : {};
@@ -2769,6 +2826,26 @@ function diagnoseSqlReadLatency() {
 // data without side effects, with one exception: testProjectsCutover's
 // real end-to-end createProject check leaves behind one real (harmless)
 // Drive folder each run -- see that function's own header comment.
+function testRecentErrors() {
+  const results = [];
+  function check(label, actual, expected) {
+    const pass = JSON.stringify(actual) === JSON.stringify(expected);
+    results.push((pass ? 'PASS' : 'FAIL') + ' -- ' + label + (pass ? '' : (': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual))));
+  }
+  const versionId = 'recent-errors-test-' + Utilities.getUuid();
+  let threw = false;
+  try {
+    doPost({ parameter: { action: 'updateVersion', payload: JSON.stringify({ id: versionId, completedDate: 'not-a-date' }) } });
+  } catch (e) {
+    threw = true;
+  }
+  check('A failing doPost still throws', threw, true);
+  const latest = JSON.parse(doGet({ parameter: { action: 'recentErrors' } }).getContent())[0] || {};
+  check('Failure recorded with its action and id', [latest.action, latest.id], ['updateVersion', versionId]);
+  check('Failure recorded with the error text', !!latest.error, true);
+  return results;
+}
+
 function runAllTests() {
   const suites = [
     ['SqlStorageLayer', testSqlStorageLayer],
@@ -2786,6 +2863,7 @@ function runAllTests() {
     ['ProjectsCutover', testProjectsCutover],
     ['VersionsCutover', testVersionsCutover],
     ['SponsorshipPackagesCutover', testSponsorshipPackagesCutover],
+    ['RecentErrors', testRecentErrors],
   ];
 
   let totalPass = 0, totalFail = 0;
