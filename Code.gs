@@ -270,20 +270,35 @@ function rowToObject_(headers, row) {
   return obj;
 }
 
+// Emails are typed in by hand in Settings (trimmed, but case kept), while
+// Session.getActiveUser() returns Google's own lowercase form. Confirmed
+// 2026-10-28: a planner set to "write" in Settings was still treated as
+// read-only, so every one of their saves was rejected. Compare
+// case-insensitively, and if someone somehow has more than one row,
+// prefer the one with write access.
+function sameEmail_(a, b) {
+  return String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
+}
+
 function getCurrentUser_() {
   const email = Session.getActiveUser().getEmail();
   const users = readRowsSql_(SHEET_NAMES.users); // cut over to SQL Connect 2026-10-08 (Phase 4)
-  const record = users.find(function (u) { return u.email === email; });
+  const matches = users.filter(function (u) { return sameEmail_(u.email, email); });
+  const record = matches.find(function (u) { return u.role === 'write'; }) || matches[0];
   return {
     email: email,
     role: record ? record.role : 'read',
     name: record ? record.name : null,
+    matchedUserRows: matches.map(function (u) { return u.email + ' (' + (u.role || 'no role') + ')'; }),
   };
 }
 
 function requireWrite_(user) {
   if (user.role !== 'write') {
-    throw new Error('Write access required for ' + user.email);
+    const detail = user.matchedUserRows && user.matchedUserRows.length
+      ? 'Users entry: ' + user.matchedUserRows.join(', ')
+      : 'no Users entry matches this email';
+    throw new Error('Write access required for ' + user.email + ' (' + detail + ')');
   }
 }
 
@@ -495,7 +510,7 @@ function sendSlackNotification_(subject, lines, emails) {
   }
   const users = readRowsSql_(SHEET_NAMES.users); // cut over to SQL Connect 2026-10-08 (Phase 4)
   const mentions = emails.map(function (email) {
-    const user = users.find(function (u) { return u.email === email; });
+    const user = users.find(function (u) { return sameEmail_(u.email, email); });
     if (user && user.slackUserId) return '<@' + user.slackUserId + '>';
     return (user && user.name) || email;
   });
@@ -2846,6 +2861,28 @@ function testRecentErrors() {
   return results;
 }
 
+function testUserEmailMatching() {
+  const results = [];
+  function check(label, actual, expected) {
+    const pass = JSON.stringify(actual) === JSON.stringify(expected);
+    results.push((pass ? 'PASS' : 'FAIL') + ' -- ' + label + (pass ? '' : (': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual))));
+  }
+  check('Emails match regardless of case and surrounding spaces', sameEmail_(' Brennen.Clark@Paramount.com ', 'brennen.clark@paramount.com'), true);
+  check('Different emails still do not match', sameEmail_('a@paramount.com', 'b@paramount.com'), false);
+
+  // The real signed-in user, stored with different capitalization, still gets write.
+  const me = Session.getActiveUser().getEmail();
+  const shouted = me.toUpperCase();
+  doPost({ parameter: { action: 'createUser', payload: JSON.stringify({ email: shouted, name: 'Case Test' }) } });
+  const users = readRowsSql_(SHEET_NAMES.users);
+  const matched = getCurrentUser_();
+  check('Signed-in user still resolves to write with an extra differently-cased row', matched.role, 'write');
+  if (users.some(function (u) { return u.email === shouted; }) && shouted !== me) {
+    deleteRowByKeySql_(SHEET_NAMES.users, USER_FIELDS, 'email', shouted);
+  }
+  return results;
+}
+
 function runAllTests() {
   const suites = [
     ['SqlStorageLayer', testSqlStorageLayer],
@@ -2864,6 +2901,7 @@ function runAllTests() {
     ['VersionsCutover', testVersionsCutover],
     ['SponsorshipPackagesCutover', testSponsorshipPackagesCutover],
     ['RecentErrors', testRecentErrors],
+    ['UserEmailMatching', testUserEmailMatching],
   ];
 
   let totalPass = 0, totalFail = 0;
