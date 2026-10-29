@@ -450,11 +450,15 @@ function listProjectFiles_(projectId) {
 // the existing file by name rather than creating a new dated one each time,
 // since this now fires automatically on every debounced sync, not on a
 // deliberate user click.
+function internalProjectFileName_(project) {
+  const sanitizedName = (project.projectName || 'untitled').replace(/[^a-z0-9]/gi, '_').toLowerCase();
+  return 'INTERNAL_' + sanitizedName + '.json';
+}
+
 function uploadProjectFile_(projectId, content) {
   const project = readRowsSql_(SHEET_NAMES.projects).find(function (p) { return p.id === projectId; }); // cut over to SQL Connect 2026-10-08 (Phase 4)
   if (!project || !project.folderId) return; // no Drive folder yet (e.g. legacy/imported project) — skip
-  const sanitizedName = (project.projectName || 'untitled').replace(/[^a-z0-9]/gi, '_').toLowerCase();
-  const filename = 'INTERNAL_' + sanitizedName + '.json';
+  const filename = internalProjectFileName_(project);
   const folder = DriveApp.getFolderById(project.folderId);
   const existing = folder.getFilesByName(filename);
   if (existing.hasNext()) {
@@ -2841,6 +2845,53 @@ function diagnoseSqlReadLatency() {
 // data without side effects, with one exception: testProjectsCutover's
 // real end-to-end createProject check leaves behind one real (harmless)
 // Drive folder each run -- see that function's own header comment.
+// One-time manual recovery (confirmed 2026-10-29; run from the Apps Script
+// editor's Run button, not exposed via doGet/doPost). Writes one version
+// back to the database from the project's INTERNAL_*.json Drive copy,
+// which every successful planner sync rewrites in full. Used when a
+// planner's work reached that file but the database copy was later
+// overwritten by someone else's stale browser copy (before the planner's
+// multi-user sync fix). Only the named version's name/packages/total are
+// touched. updatedBy is deliberately not the person running this, so every
+// planner treats it as someone else's change (pulled in, or asked about)
+// rather than as their own save to overwrite.
+function restoreVersionFromDriveCopy_(projectId, versionId) {
+  const project = readRowsSql_(SHEET_NAMES.projects).find(function (p) { return p.id === projectId; });
+  if (!project) throw new Error('No project ' + projectId);
+  if (!project.folderId) throw new Error('Project has no Drive folder: ' + projectId);
+  const filename = internalProjectFileName_(project);
+  const files = DriveApp.getFolderById(project.folderId).getFilesByName(filename);
+  if (!files.hasNext()) throw new Error('No ' + filename + ' in the project folder');
+  const file = files.next();
+  const copy = JSON.parse(file.getBlob().getDataAsString());
+  const fromFile = (copy.versions || []).find(function (v) { return v.id === versionId; });
+  if (!fromFile) throw new Error('Version ' + versionId + ' is not in ' + filename);
+  const current = readRowsSql_(SHEET_NAMES.versions).find(function (v) { return v.id === versionId; });
+  if (!current) throw new Error('Version ' + versionId + ' is not in the database');
+
+  const packages = fromFile.packages || [];
+  const total = packages.reduce(function (sum, p) { return sum + (Number(p.totalInvestment) || 0); }, 0);
+  Logger.log('Drive copy: ' + filename + ', last saved ' + file.getLastUpdated());
+  Logger.log('Before: "' + current.name + '" -- ' + (current.packages || []).length + ' package(s), total ' + current.totalInvestment);
+
+  updateRecordSql_(SHEET_NAMES.versions, VERSION_FIELDS, 'id', versionId, {
+    id: versionId,
+    name: fromFile.name,
+    packages: packages,
+    totalInvestment: total,
+    updatedAt: new Date().toISOString(),
+    updatedBy: 'Drive copy restore (run by ' + Session.getActiveUser().getEmail() + ')',
+  });
+
+  const after = readRowsSql_(SHEET_NAMES.versions).find(function (v) { return v.id === versionId; });
+  Logger.log('After:  "' + after.name + '" -- ' + (after.packages || []).length + ' package(s), total ' + after.totalInvestment);
+}
+
+// MTV Unplugged x CLEAR & VISA -- "VISA $15MM PLAN" (2026-10-29).
+function restoreVisaPlanFromDriveCopy() {
+  restoreVersionFromDriveCopy_('proj-1793125340043', '613c162c-06fc-4e5c-a120-21d6acc6ce5a');
+}
+
 function testRecentErrors() {
   const results = [];
   function check(label, actual, expected) {
