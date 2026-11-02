@@ -874,7 +874,10 @@ function doPostImpl_(e) {
     cascadeForeignKeySql_(SHEET_NAMES.teamRoster, TEAM_ROSTER_FIELDS, 'pitchTeam', values.name, ''); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'createUser') {
     requireWrite_(user);
-    values.role = values.role || 'read';
+    // Write by default (decided 2026-11-02): this list is media planners,
+    // who all need to save work -- defaulting to read is how a planner's
+    // work silently never reached anyone else. Read is still settable.
+    values.role = values.role || 'write';
     appendRecordSql_(SHEET_NAMES.users, USER_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'updateUser') {
     // payload: { originalEmail, email, name, role? } — role is optional so a
@@ -1671,38 +1674,83 @@ DC_ENTITY_[SHEET_NAMES.closedDeals] = { type: 'closedDeal', listOp: 'ListClosedD
 // columns in Postgres (deliberately not normalized into child tables yet,
 // see schema.gql's own header comment), so the same stringify-on-write/
 // parse-on-read behavior must be preserved exactly.
-// Every non-String column in schema.gql (Date/Timestamp/Float, all
-// nullable). Confirmed 2026-10-16: the web form sends an untouched date
-// input as "", which Sheets happily stored but Postgres's Date type
-// rejects outright ("$planDueDate is invalid Date: string \"\" is not in
-// YYYY-MM-DD format") -- failing the whole createProject. Blank means
-// "no value" for these, so it's sent as null. String columns are left
-// alone: the frontends read "" back and call .trim() etc. on it.
-const DC_NON_STRING_FIELDS_ = [
-  'planRequestDate', 'planDueDate', 'campaignStartDate', 'campaignEndDate', 'completedDate',
-  'createdAt', 'updatedAt', 'verifiedAt', 'markedClosedAt', 'verified_at', 'marked_closed_at', 'updated_at',
-  'sharedRate', 'totalInvestment', 'totalMarginPercent', 'total_investment', 'total_margin_percent',
-];
+// Every non-String column in schema.gql, by its Code.gs-side field name
+// (ClosedDeal's snake_case names included). Everything else is String.
+// Sheets stored whatever it was given; Postgres rejects a value of the
+// wrong shape outright and fails the whole save. Confirmed so far: ""
+// into a Date (2026-10-16, every assignment without all four dates), a
+// full timestamp into a Date (2026-10-28, completed versions), and a
+// bare number into a String (2026-10-08, a season named "2026"). An
+// audit on 2026-11-02 found the remaining shapes that would fail the
+// same way -- "11/05/2026" into a Date, "1,250" or "$40" into a Float,
+// "TRUE"/"Yes" into a Boolean -- so every value is cleaned up here, on
+// the one path all SQL writes share, rather than at each caller.
+const DC_FIELD_TYPES_ = {
+  Date: ['planRequestDate', 'planDueDate', 'campaignStartDate', 'campaignEndDate', 'completedDate'],
+  Timestamp: ['createdAt', 'updatedAt', 'verifiedAt', 'markedClosedAt', 'verified_at', 'marked_closed_at', 'updated_at'],
+  Float: ['sharedRate', 'totalInvestment', 'totalMarginPercent', 'total_investment', 'total_margin_percent'],
+  Boolean: ['rushRequest'],
+};
+const DC_FIELD_TYPE_BY_NAME_ = (function () {
+  const byName = {};
+  Object.keys(DC_FIELD_TYPES_).forEach(function (type) {
+    DC_FIELD_TYPES_[type].forEach(function (name) { byName[name] = type; });
+  });
+  return byName;
+})();
 
-// Date (day-only) columns. Confirmed 2026-10-28: the planner tool sent
-// completedDate as a full ISO timestamp, which Postgres's Date type
-// rejects -- trimmed to its YYYY-MM-DD day here so any caller doing the
-// same still saves.
-const DC_DATE_FIELDS_ = ['planRequestDate', 'planDueDate', 'campaignStartDate', 'campaignEndDate', 'completedDate'];
+// Returns the value in the shape its column accepts. Anything that can't
+// be read unambiguously is passed through unchanged, so the database's
+// own error (recorded by doPost's recentErrors) still says what was wrong,
+// rather than the value being silently dropped.
+function dcCoerceValue_(field, v) {
+  const type = DC_FIELD_TYPE_BY_NAME_[field];
+  if (v === undefined || v === null) return v;
+  if (!type) {
+    // String column: a number or true/false becomes its text.
+    return (typeof v === 'number' || typeof v === 'boolean') ? String(v) : v;
+  }
+  if (typeof v === 'string' && v.trim() === '') return null; // blank means "no value"
+  if (type === 'Date' && typeof v === 'string') {
+    const t = v.trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
+    if (/^\d{4}-\d{2}-\d{2}T/.test(t)) return t.slice(0, 10);
+    const us = t.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/); // M/D/YYYY
+    if (us) return us[3] + '-' + ('0' + us[1]).slice(-2) + '-' + ('0' + us[2]).slice(-2);
+    return v;
+  }
+  if (type === 'Timestamp' && typeof v === 'string') {
+    const t = v.trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t + 'T00:00:00Z';
+    return t;
+  }
+  if (type === 'Float') {
+    if (typeof v === 'number') return isFinite(v) ? v : null;
+    if (typeof v === 'string') {
+      const cleaned = v.replace(/[$,\s]/g, '');
+      if (/^-?\d+(\.\d+)?$/.test(cleaned)) return Number(cleaned);
+    }
+    return v;
+  }
+  if (type === 'Boolean') {
+    if (typeof v === 'boolean') return v;
+    const t = String(v).trim().toLowerCase();
+    if (['true', 'yes', 'y', '1'].includes(t)) return true;
+    if (['false', 'no', 'n', '0'].includes(t)) return false;
+    return v;
+  }
+  return v;
+}
 
 function dcStringifyJsonFields_(values) {
   const out = {};
   Object.keys(values).forEach(function (k) {
     const v = values[k];
-    if (DC_NON_STRING_FIELDS_.includes(k) && v === '') {
-      out[k] = null;
+    if (JSON_FIELDS.includes(k) && v && typeof v === 'object') {
+      out[k] = JSON.stringify(v);
       return;
     }
-    if (DC_DATE_FIELDS_.includes(k) && typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(v)) {
-      out[k] = v.slice(0, 10);
-      return;
-    }
-    out[k] = (JSON_FIELDS.includes(k) && v && typeof v === 'object') ? JSON.stringify(v) : v;
+    out[k] = dcCoerceValue_(k, v);
   });
   return out;
 }
@@ -2845,53 +2893,6 @@ function diagnoseSqlReadLatency() {
 // data without side effects, with one exception: testProjectsCutover's
 // real end-to-end createProject check leaves behind one real (harmless)
 // Drive folder each run -- see that function's own header comment.
-// One-time manual recovery (confirmed 2026-10-29; run from the Apps Script
-// editor's Run button, not exposed via doGet/doPost). Writes one version
-// back to the database from the project's INTERNAL_*.json Drive copy,
-// which every successful planner sync rewrites in full. Used when a
-// planner's work reached that file but the database copy was later
-// overwritten by someone else's stale browser copy (before the planner's
-// multi-user sync fix). Only the named version's name/packages/total are
-// touched. updatedBy is deliberately not the person running this, so every
-// planner treats it as someone else's change (pulled in, or asked about)
-// rather than as their own save to overwrite.
-function restoreVersionFromDriveCopy_(projectId, versionId) {
-  const project = readRowsSql_(SHEET_NAMES.projects).find(function (p) { return p.id === projectId; });
-  if (!project) throw new Error('No project ' + projectId);
-  if (!project.folderId) throw new Error('Project has no Drive folder: ' + projectId);
-  const filename = internalProjectFileName_(project);
-  const files = DriveApp.getFolderById(project.folderId).getFilesByName(filename);
-  if (!files.hasNext()) throw new Error('No ' + filename + ' in the project folder');
-  const file = files.next();
-  const copy = JSON.parse(file.getBlob().getDataAsString());
-  const fromFile = (copy.versions || []).find(function (v) { return v.id === versionId; });
-  if (!fromFile) throw new Error('Version ' + versionId + ' is not in ' + filename);
-  const current = readRowsSql_(SHEET_NAMES.versions).find(function (v) { return v.id === versionId; });
-  if (!current) throw new Error('Version ' + versionId + ' is not in the database');
-
-  const packages = fromFile.packages || [];
-  const total = packages.reduce(function (sum, p) { return sum + (Number(p.totalInvestment) || 0); }, 0);
-  Logger.log('Drive copy: ' + filename + ', last saved ' + file.getLastUpdated());
-  Logger.log('Before: "' + current.name + '" -- ' + (current.packages || []).length + ' package(s), total ' + current.totalInvestment);
-
-  updateRecordSql_(SHEET_NAMES.versions, VERSION_FIELDS, 'id', versionId, {
-    id: versionId,
-    name: fromFile.name,
-    packages: packages,
-    totalInvestment: total,
-    updatedAt: new Date().toISOString(),
-    updatedBy: 'Drive copy restore (run by ' + Session.getActiveUser().getEmail() + ')',
-  });
-
-  const after = readRowsSql_(SHEET_NAMES.versions).find(function (v) { return v.id === versionId; });
-  Logger.log('After:  "' + after.name + '" -- ' + (after.packages || []).length + ' package(s), total ' + after.totalInvestment);
-}
-
-// MTV Unplugged x CLEAR & VISA -- "VISA $15MM PLAN" (2026-10-29).
-function restoreVisaPlanFromDriveCopy() {
-  restoreVersionFromDriveCopy_('proj-1793125340043', '613c162c-06fc-4e5c-a120-21d6acc6ce5a');
-}
-
 function testRecentErrors() {
   const results = [];
   function check(label, actual, expected) {
@@ -2934,6 +2935,38 @@ function testUserEmailMatching() {
   return results;
 }
 
+// 2026-11-02 audit: values in the shapes the frontends (or a future sheet
+// import) can send, saved through the real database and read back.
+function testValueShapes() {
+  const results = [];
+  function check(label, actual, expected) {
+    const pass = JSON.stringify(actual) === JSON.stringify(expected);
+    results.push((pass ? 'PASS' : 'FAIL') + ' -- ' + label + (pass ? '' : (': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual))));
+  }
+  const id = 'value-shapes-test-' + Utilities.getUuid();
+  appendRecordSql_(SHEET_NAMES.projects, PROJECT_FIELDS, {
+    id: id, projectName: 2026, account: 'Value Shapes', rushRequest: 'Yes',
+    planDueDate: '11/5/2026', planRequestDate: '2026-10-28T19:04:11.123Z', campaignStartDate: '',
+  });
+  let row = readRowsSql_(SHEET_NAMES.projects).find(function (p) { return p.id === id; }) || {};
+  check('A number saved to a text field comes back as text', row.projectName, '2026');
+  check('"Yes" saved to Rush Request comes back as true', row.rushRequest, true);
+  check('"11/5/2026" saved to a date comes back as 2026-11-05', row.planDueDate, '2026-11-05');
+  check('A full timestamp saved to a date keeps its day', row.planRequestDate, '2026-10-28');
+  check('A blank date comes back empty', row.campaignStartDate || null, null);
+  updateRecordSql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'id', id, { id: id, rushRequest: 'FALSE' });
+  row = readRowsSql_(SHEET_NAMES.projects).find(function (p) { return p.id === id; }) || {};
+  check('"FALSE" saved to Rush Request comes back as false', row.rushRequest, false);
+  deleteRowByKeySql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'id', id);
+
+  const itemId = 'value-shapes-item-' + Utilities.getUuid();
+  appendRecordSql_(SHEET_NAMES.placementMenuItems, PLACEMENT_MENU_ITEM_FIELDS, { id: itemId, categoryId: 'value-shapes-test', name: 'Rate test', sharedRate: '$1,250.50' });
+  const item = readRowsSql_(SHEET_NAMES.placementMenuItems).find(function (r) { return r.id === itemId; }) || {};
+  check('"$1,250.50" saved to a rate comes back as 1250.5', item.sharedRate, 1250.5);
+  deleteRowByKeySql_(SHEET_NAMES.placementMenuItems, PLACEMENT_MENU_ITEM_FIELDS, 'id', itemId);
+  return results;
+}
+
 function runAllTests() {
   const suites = [
     ['SqlStorageLayer', testSqlStorageLayer],
@@ -2953,6 +2986,7 @@ function runAllTests() {
     ['SponsorshipPackagesCutover', testSponsorshipPackagesCutover],
     ['RecentErrors', testRecentErrors],
     ['UserEmailMatching', testUserEmailMatching],
+    ['ValueShapes', testValueShapes],
   ];
 
   let totalPass = 0, totalFail = 0;
