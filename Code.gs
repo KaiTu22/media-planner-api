@@ -274,31 +274,34 @@ function rowToObject_(headers, row) {
 // Session.getActiveUser() returns Google's own lowercase form. Confirmed
 // 2026-10-28: a planner set to "write" in Settings was still treated as
 // read-only, so every one of their saves was rejected. Compare
-// case-insensitively, and if someone somehow has more than one row,
-// prefer the one with write access.
+// case-insensitively.
 function sameEmail_(a, b) {
   return String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
 }
 
-function getCurrentUser_() {
-  const email = Session.getActiveUser().getEmail();
-  const users = readRowsSql_(SHEET_NAMES.users); // cut over to SQL Connect 2026-10-08 (Phase 4)
+// Access rule (confirmed 2026-11-10): everyone signed in with a paramount.com
+// account can view (the web app's DOMAIN access setting); anyone on the Lead
+// Media Planners list (Users) can also create and edit; everyone else is
+// read-only. The old per-row Read/Write role is no longer consulted -- being
+// on the list is what grants editing. `role` is still reported as
+// 'write'/'read' because both frontends read it from whoami.
+function userAccess_(email, users) {
   const matches = users.filter(function (u) { return sameEmail_(u.email, email); });
-  const record = matches.find(function (u) { return u.role === 'write'; }) || matches[0];
+  const record = matches[0];
   return {
     email: email,
-    role: record ? record.role : 'read',
+    role: record ? 'write' : 'read',
     name: record ? record.name : null,
-    matchedUserRows: matches.map(function (u) { return u.email + ' (' + (u.role || 'no role') + ')'; }),
   };
+}
+
+function getCurrentUser_() {
+  return userAccess_(Session.getActiveUser().getEmail(), readRowsSql_(SHEET_NAMES.users)); // cut over to SQL Connect 2026-10-08 (Phase 4)
 }
 
 function requireWrite_(user) {
   if (user.role !== 'write') {
-    const detail = user.matchedUserRows && user.matchedUserRows.length
-      ? 'Users entry: ' + user.matchedUserRows.join(', ')
-      : 'no Users entry matches this email';
-    throw new Error('Write access required for ' + user.email + ' (' + detail + ')');
+    throw new Error('Edit access required for ' + user.email + ' (not on the Lead Media Planners list)');
   }
 }
 
@@ -880,14 +883,10 @@ function doPostImpl_(e) {
     values.role = values.role || 'write';
     appendRecordSql_(SHEET_NAMES.users, USER_FIELDS, values); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'updateUser') {
-    // payload: { originalEmail, email, name, role? } — role is optional so a
-    // plain name/email edit never accidentally touches it; only sent when
-    // the Lead Media Planners settings page's role toggle is what changed
-    // (confirmed 2026-09-14 — Write access is still a deliberate action,
-    // just now one taken from this page instead of hand-editing the Sheet).
+    // payload: { originalEmail, email, name }. Role isn't edited any more
+    // (2026-11-10): being on this list is what grants editing.
     requireWrite_(user);
     const patch = { email: values.email, name: values.name };
-    if (values.role) patch.role = values.role;
     updateRecordSql_(SHEET_NAMES.users, USER_FIELDS, 'email', values.originalEmail, patch); // cut over to SQL Connect 2026-10-08 (Phase 4)
   } else if (action === 'deleteUser') {
     requireWrite_(user);
@@ -2453,9 +2452,9 @@ function testUsersCutover() {
   let list = JSON.parse(doGet({ parameter: { action: 'listUsers' } }).getContent());
   check('User appears via doGet(listUsers) after doPost(createUser)', list.some(function (u) { return u.email === email; }), true);
 
-  doPost({ parameter: { action: 'updateUser', payload: JSON.stringify({ originalEmail: email, email: email, name: name + ' Renamed', role: 'write' }) } });
+  doPost({ parameter: { action: 'updateUser', payload: JSON.stringify({ originalEmail: email, email: email, name: name + ' Renamed' }) } });
   list = JSON.parse(doGet({ parameter: { action: 'listUsers' } }).getContent());
-  check('User renamed+role updated via doPost(updateUser)', list.find(function (u) { return u.email === email; }).name + '|' + list.find(function (u) { return u.email === email; }).role, name + ' Renamed|write');
+  check('User renamed via doPost(updateUser)', list.find(function (u) { return u.email === email; }).name, name + ' Renamed');
 
   doPost({ parameter: { action: 'deleteUser', payload: JSON.stringify({ email: email }) } });
   list = JSON.parse(doGet({ parameter: { action: 'listUsers' } }).getContent());
@@ -2929,6 +2928,16 @@ function testUserEmailMatching() {
   const users = readRowsSql_(SHEET_NAMES.users);
   const matched = getCurrentUser_();
   check('Signed-in user still resolves to write with an extra differently-cased row', matched.role, 'write');
+
+  // 2026-11-10 rule: on the list means edit access, whatever its old role
+  // says; not on the list means read-only.
+  const rows = [{ email: 'Listed.Reader@paramount.com', name: 'Listed', role: 'read' }, { email: 'no.role@paramount.com', name: 'No Role' }];
+  check('On the list with an old "read" role still gets edit access', userAccess_('listed.reader@paramount.com', rows).role, 'write');
+  check('On the list with no role gets edit access', userAccess_('no.role@paramount.com', rows).role, 'write');
+  check('Not on the list is read-only', userAccess_('someone.else@paramount.com', rows).role, 'read');
+  let refused = '';
+  try { requireWrite_(userAccess_('someone.else@paramount.com', rows)); } catch (e) { refused = e.message; }
+  check('A save by someone not on the list is refused, saying why', refused, 'Edit access required for someone.else@paramount.com (not on the Lead Media Planners list)');
   if (users.some(function (u) { return u.email === shouted; }) && shouted !== me) {
     deleteRowByKeySql_(SHEET_NAMES.users, USER_FIELDS, 'email', shouted);
   }
