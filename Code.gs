@@ -23,6 +23,8 @@ const SHEET_NAMES = {
   sponsorshipPackages: 'SponsorshipPackages',
   placementCategories: 'PlacementCategories',
   placementMenuItems: 'PlacementMenuItems',
+  scratchpads: 'Scratchpads',
+  appSettings: 'AppSettings',
 };
 
 // slackUserId is optional and manually entered (e.g. copied from a
@@ -149,6 +151,32 @@ const CLOSED_DEAL_FIELDS = [
   'total_investment', 'total_margin_percent', 'snapshot', 'updated_at',
 ];
 
+// Investment Approval Scratchpad (confirmed 2026-11-11) -- an optional,
+// top-down agreement on how a deal's money splits up, attached to a
+// project (more than one allowed). Replaces Project.scratchpadLink.
+// `details` is the whole worksheet as JSON (see JSON_FIELDS): header,
+// investment lines, talent and production rows, and the rates it was built
+// with, so a later change to the defaults never changes an old scratchpad.
+// status: 'draft' | 'approved' | 'archived'. Postgres-only -- there was
+// never a Sheets tab for this.
+const SCRATCHPAD_FIELDS = [
+  'id', 'projectId', 'name', 'status', 'approvedBy', 'approvedAt', 'details',
+  'createdAt', 'createdBy', 'updatedAt', 'updatedBy',
+];
+const SCRATCHPAD_STATUSES_ = ['draft', 'approved', 'archived'];
+
+// App-wide settings keyed by name, value is JSON. Only 'scratchpadDefaults'
+// exists so far (rates, SAG types, the partner-type production table).
+const APP_SETTING_FIELDS = ['key', 'value', 'updatedAt', 'updatedBy'];
+const APP_SETTING_KEYS_ = ['scratchpadDefaults'];
+
+// Where the "email a link" message points (media-planner-app's own route).
+const SCRATCHPAD_APP_URL_ = 'https://kaitu22.github.io/media-planner-app/#/scratchpads/';
+
+// Mirrors the Production Guidelines: no custom production on deals under
+// $500K. The app shows this as an error; approving is refused here too.
+const SCRATCHPAD_PRODUCTION_FLOOR_ = 500000;
+
 // Preset swatches only (confirmed 2026-09-10) — matches the managed-tag
 // philosophy (§6.3): picking from a fixed palette keeps every tag visually
 // distinct without letting anyone pick an illegible or clashing custom hex.
@@ -248,7 +276,8 @@ function readRows_(sheetName) {
 // Fields that store a nested JS object as a JSON string in the sheet cell —
 // stringified on write, parsed back out on read. 'snapshot' (ClosedDeals)
 // added 2026-09-16 alongside the original 'packages' (Versions).
-const JSON_FIELDS = ['packages', 'snapshot', 'placements', 'blendGroups', 'lines'];
+// 'details' (Scratchpads) and 'value' (AppSettings) added 2026-11-11.
+const JSON_FIELDS = ['packages', 'snapshot', 'placements', 'blendGroups', 'lines', 'details', 'value'];
 
 function rowToObject_(headers, row) {
   const obj = {};
@@ -573,6 +602,7 @@ function deleteProject_(projectId) {
   // cut over to SQL Connect 2026-10-08 (Phase 4)
   deleteRowsByForeignKeySql_(SHEET_NAMES.versions, VERSION_FIELDS, 'projectId', projectId);
   deleteRowsByForeignKeySql_(SHEET_NAMES.projectFileLinks, PROJECT_FILE_LINK_FIELDS, 'projectId', projectId);
+  deleteRowsByForeignKeySql_(SHEET_NAMES.scratchpads, SCRATCHPAD_FIELDS, 'projectId', projectId);
   deleteRowByKeySql_(SHEET_NAMES.projects, PROJECT_FIELDS, 'id', projectId);
 }
 
@@ -597,6 +627,117 @@ function deleteTag_(tagId) {
   });
 
   deleteRowByKeySql_(SHEET_NAMES.tags, TAG_FIELDS, 'id', tagId);
+}
+
+function findScratchpad_(id) {
+  const scratchpad = readRowsSql_(SHEET_NAMES.scratchpads).find(function (r) { return r.id === id; });
+  if (!scratchpad) throw new Error('Scratchpad not found: ' + id);
+  return scratchpad;
+}
+
+function createScratchpad_(values, user, now) {
+  if (!values.projectId) throw new Error('A scratchpad needs a project.');
+  appendRecordSql_(SHEET_NAMES.scratchpads, SCRATCHPAD_FIELDS, {
+    id: values.id || Utilities.getUuid(),
+    projectId: values.projectId,
+    name: values.name || 'Scratchpad',
+    status: 'draft', // always starts as a draft, even when duplicated from an approved one
+    approvedBy: null,
+    approvedAt: null,
+    details: values.details || {},
+    createdAt: now,
+    createdBy: user.email,
+    updatedAt: now,
+    updatedBy: user.email,
+  });
+}
+
+// Any edit to an approved scratchpad sends it back to draft, so an agreed
+// plan can't change without being approved again. Archived ones have to be
+// restored before they can be edited.
+function updateScratchpad_(values, user, now) {
+  const existing = findScratchpad_(values.id);
+  if (existing.status === 'archived') throw new Error('This scratchpad is archived. Restore it before editing.');
+  const patch = { id: values.id, updatedAt: now, updatedBy: user.email };
+  if (Object.prototype.hasOwnProperty.call(values, 'name')) patch.name = values.name;
+  if (Object.prototype.hasOwnProperty.call(values, 'details')) patch.details = values.details;
+  if (existing.status === 'approved') {
+    patch.status = 'draft';
+    patch.approvedBy = null;
+    patch.approvedAt = null;
+  }
+  updateRecordSql_(SHEET_NAMES.scratchpads, SCRATCHPAD_FIELDS, 'id', values.id, patch);
+}
+
+// The checks the app also shows, repeated here so approving can't skip
+// them: the three required header fields, and the $500K production floor.
+function scratchpadApprovalProblems_(details) {
+  const d = details || {};
+  const problems = [];
+  if (!String(d.advertiser || '').trim()) problems.push('Advertiser is required.');
+  if (!String(d.ip || '').trim()) problems.push('IP is required.');
+  const total = Number(d.totalInvestment) || 0;
+  if (total <= 0) problems.push('Total investment is required.');
+  const production = (d.lines || []).reduce(function (sum, line) {
+    return line && line.mediaType === 'Production and Talent' ? sum + (Number(line.investment) || 0) : sum;
+  }, 0);
+  if (production > 0 && total < SCRATCHPAD_PRODUCTION_FLOOR_) {
+    problems.push('No custom production on deals under $500K.');
+  }
+  return problems;
+}
+
+// draft -> approved (Approve), approved -> draft (Remove approval),
+// draft/approved -> archived (Archive), archived -> draft (Restore).
+function setScratchpadStatus_(id, status, user, now) {
+  if (!SCRATCHPAD_STATUSES_.includes(status)) throw new Error('Unknown scratchpad status: ' + status);
+  const existing = findScratchpad_(id);
+  const patch = { id: id, status: status, updatedAt: now, updatedBy: user.email };
+  if (status === 'approved') {
+    if (existing.status !== 'draft') throw new Error('Only a draft can be approved.');
+    const problems = scratchpadApprovalProblems_(existing.details);
+    if (problems.length) throw new Error('Cannot approve: ' + problems.join(' '));
+    patch.approvedBy = user.email;
+    patch.approvedAt = now;
+  } else if (status === 'draft') {
+    patch.approvedBy = null;
+    patch.approvedAt = null;
+  }
+  updateRecordSql_(SHEET_NAMES.scratchpads, SCRATCHPAD_FIELDS, 'id', id, patch);
+}
+
+// Only Paramount addresses: the page itself is DOMAIN-restricted, so a link
+// sent anywhere else wouldn't open, and this keeps the markup in-house.
+function scratchpadRecipients_(to) {
+  const list = (Array.isArray(to) ? to : String(to || '').split(/[,;\s]+/))
+    .map(function (e) { return String(e || '').trim().toLowerCase(); })
+    .filter(Boolean);
+  const deduped = Array.from(new Set(list));
+  if (deduped.length === 0) throw new Error('Add at least one email address.');
+  if (deduped.length > 50) throw new Error('Send to 50 people or fewer at a time.');
+  const outside = deduped.filter(function (e) { return !/^[^@\s]+@paramount\.com$/.test(e); });
+  if (outside.length) throw new Error('Only paramount.com addresses can be sent a scratchpad link: ' + outside.join(', '));
+  return deduped;
+}
+
+function emailScratchpadLink_(id, to, note, user) {
+  const recipients = scratchpadRecipients_(to);
+  const scratchpad = findScratchpad_(id);
+  const project = readRowsSql_(SHEET_NAMES.projects).find(function (p) { return p.id === scratchpad.projectId; }) || {};
+  const statusLabel = { draft: 'Draft', approved: 'Approved', archived: 'Archived' }[scratchpad.status] || scratchpad.status;
+  const subject = 'Investment Approval Scratchpad: ' + (scratchpad.name || 'Scratchpad') + (project.projectName ? ' (' + project.projectName + ')' : '');
+  const lines = [
+    (user.name || user.email) + ' shared an Investment Approval Scratchpad with you.',
+    '',
+    note ? String(note).trim() : null,
+    note ? '' : null,
+    'Project: ' + (project.projectName || '-'),
+    'Scratchpad: ' + (scratchpad.name || 'Scratchpad') + ' (' + statusLabel + ')',
+    scratchpad.status === 'approved' && scratchpad.approvedBy ? 'Approved by: ' + scratchpad.approvedBy : null,
+    '',
+    'View it here: ' + SCRATCHPAD_APP_URL_ + encodeURIComponent(scratchpad.id),
+  ].filter(function (l) { return l !== null; });
+  MailApp.sendEmail({ to: recipients.join(','), replyTo: user.email, subject: subject, body: lines.join('\n') });
 }
 
 function respond_(result, callback) {
@@ -646,6 +787,15 @@ function doGet(e) {
       result = readRowsSql_(SHEET_NAMES.placementCategories); // cut over to SQL Connect 2026-10-08 (Phase 4)
     } else if (action === 'listPlacementMenuItems') {
       result = readRowsSql_(SHEET_NAMES.placementMenuItems); // cut over to SQL Connect 2026-10-08 (Phase 4)
+    } else if (action === 'listScratchpads') {
+      // Optional projectId / id narrow it down; with neither, every scratchpad.
+      result = readRowsSql_(SHEET_NAMES.scratchpads).filter(function (r) {
+        if (e.parameter.projectId && r.projectId !== e.parameter.projectId) return false;
+        if (e.parameter.id && r.id !== e.parameter.id) return false;
+        return true;
+      });
+    } else if (action === 'listAppSettings') {
+      result = readRowsSql_(SHEET_NAMES.appSettings);
     } else if (action === 'whoami') {
       result = getCurrentUser_();
     } else {
@@ -988,6 +1138,22 @@ function doPostImpl_(e) {
   } else if (action === 'deletePlacementMenuItem') {
     requireWrite_(user);
     deleteRowByKeySql_(SHEET_NAMES.placementMenuItems, PLACEMENT_MENU_ITEM_FIELDS, 'id', values.id); // cut over to SQL Connect 2026-10-08 (Phase 4)
+  } else if (action === 'createScratchpad') {
+    requireWrite_(user);
+    createScratchpad_(values, user, now);
+  } else if (action === 'updateScratchpad') {
+    requireWrite_(user);
+    updateScratchpad_(values, user, now);
+  } else if (action === 'setScratchpadStatus') {
+    requireWrite_(user);
+    setScratchpadStatus_(values.id, values.status, user, now);
+  } else if (action === 'emailScratchpadLink') {
+    requireWrite_(user);
+    emailScratchpadLink_(values.id, values.to, values.note, user);
+  } else if (action === 'saveAppSetting') {
+    requireWrite_(user);
+    if (!APP_SETTING_KEYS_.includes(values.key)) throw new Error('Unknown setting: ' + values.key);
+    appendRecordSql_(SHEET_NAMES.appSettings, APP_SETTING_FIELDS, { key: values.key, value: values.value, updatedAt: now, updatedBy: user.email });
   }
 
   return ContentService.createTextOutput('ok').setMimeType(ContentService.MimeType.TEXT);
@@ -1578,6 +1744,52 @@ mutation DeleteProjectFileLinksByProjectId($projectId: String) {
 mutation DeleteVersionsByProjectId($projectId: String) {
   version_deleteMany(where: { projectId: { eq: $projectId } })
 }
+
+query ListScratchpads {
+  scratchpads(limit: 10000) {
+    id
+    projectId
+    name
+    status
+    approvedBy
+    approvedAt
+    details
+    createdAt
+    createdBy
+    updatedAt
+    updatedBy
+  }
+}
+mutation CreateScratchpad($id: String!, $projectId: String, $name: String, $status: String, $approvedBy: String, $approvedAt: Timestamp, $details: String, $createdAt: Timestamp, $createdBy: String, $updatedAt: Timestamp, $updatedBy: String) {
+  scratchpad_insert(data: { id: $id, projectId: $projectId, name: $name, status: $status, approvedBy: $approvedBy, approvedAt: $approvedAt, details: $details, createdAt: $createdAt, createdBy: $createdBy, updatedAt: $updatedAt, updatedBy: $updatedBy })
+}
+mutation UpdateScratchpad($id: String!, $projectId: String, $name: String, $status: String, $approvedBy: String, $approvedAt: Timestamp, $details: String, $updatedAt: Timestamp, $updatedBy: String) {
+  scratchpad_update(key: { id: $id }, data: { projectId: $projectId, name: $name, status: $status, approvedBy: $approvedBy, approvedAt: $approvedAt, details: $details, updatedAt: $updatedAt, updatedBy: $updatedBy })
+}
+mutation DeleteScratchpad($id: String!) {
+  scratchpad_delete(key: { id: $id })
+}
+mutation DeleteScratchpadsByProjectId($projectId: String) {
+  scratchpad_deleteMany(where: { projectId: { eq: $projectId } })
+}
+
+query ListAppSettings {
+  appSettings(limit: 10000) {
+    key
+    value
+    updatedAt
+    updatedBy
+  }
+}
+mutation UpsertAppSetting($key: String!, $value: String, $updatedAt: Timestamp, $updatedBy: String) {
+  appSetting_upsert(data: { key: $key, value: $value, updatedAt: $updatedAt, updatedBy: $updatedBy })
+}
+mutation UpdateAppSetting($key: String!, $value: String, $updatedAt: Timestamp, $updatedBy: String) {
+  appSetting_update(key: { key: $key }, data: { value: $value, updatedAt: $updatedAt, updatedBy: $updatedBy })
+}
+mutation DeleteAppSetting($key: String!) {
+  appSetting_delete(key: { key: $key })
+}
 `;
 
 // Confirmed 2026-10-12 (via runAllTests): under sustained load, the SQL
@@ -1666,6 +1878,8 @@ DC_ENTITY_[SHEET_NAMES.projects] = { type: 'project', listOp: 'ListProjects', li
 DC_ENTITY_[SHEET_NAMES.versions] = { type: 'version', listOp: 'ListVersions', listField: 'versions', createOp: 'CreateVersion', updateOp: 'UpdateVersion', updateKeyVar: 'id', deleteOp: 'DeleteVersion' };
 DC_ENTITY_[SHEET_NAMES.sponsorshipPackages] = { type: 'sponsorshipPackage', listOp: 'ListSponsorshipPackages', listField: 'sponsorshipPackages', createOp: 'CreateSponsorshipPackage', updateOp: 'UpdateSponsorshipPackage', updateKeyVar: 'id', deleteOp: 'DeleteSponsorshipPackage' };
 DC_ENTITY_[SHEET_NAMES.projectFileLinks] = { type: 'projectFileLink', listOp: 'ListProjectFileLinks', listField: 'projectFileLinks', createOp: 'CreateProjectFileLink', deleteOp: 'DeleteProjectFileLink' }; // no update action exists for this entity
+DC_ENTITY_[SHEET_NAMES.scratchpads] = { type: 'scratchpad', listOp: 'ListScratchpads', listField: 'scratchpads', createOp: 'CreateScratchpad', updateOp: 'UpdateScratchpad', updateKeyVar: 'id', deleteOp: 'DeleteScratchpad' };
+DC_ENTITY_[SHEET_NAMES.appSettings] = { type: 'appSetting', listOp: 'ListAppSettings', listField: 'appSettings', createOp: 'UpsertAppSetting', updateOp: 'UpdateAppSetting', updateKeyVar: 'key', deleteOp: 'DeleteAppSetting' };
 DC_ENTITY_[SHEET_NAMES.closedDeals] = { type: 'closedDeal', listOp: 'ListClosedDeals', listField: 'closedDeals', createOp: 'UpsertClosedDeal', updateOp: 'UpdateClosedDeal', updateKeyVar: 'dealId', deleteOp: 'DeleteClosedDeal', fieldMap: CLOSED_DEAL_FIELD_TO_GQL_, fieldMapReverse: CLOSED_DEAL_FIELD_FROM_GQL_ };
 
 // Same JSON_FIELDS convention as rowToObject_/appendRecord_ above --
@@ -1686,7 +1900,7 @@ DC_ENTITY_[SHEET_NAMES.closedDeals] = { type: 'closedDeal', listOp: 'ListClosedD
 // the one path all SQL writes share, rather than at each caller.
 const DC_FIELD_TYPES_ = {
   Date: ['planRequestDate', 'planDueDate', 'campaignStartDate', 'campaignEndDate', 'completedDate'],
-  Timestamp: ['createdAt', 'updatedAt', 'verifiedAt', 'markedClosedAt', 'verified_at', 'marked_closed_at', 'updated_at'],
+  Timestamp: ['createdAt', 'updatedAt', 'verifiedAt', 'markedClosedAt', 'approvedAt', 'verified_at', 'marked_closed_at', 'updated_at'],
   Float: ['sharedRate', 'totalInvestment', 'totalMarginPercent', 'total_investment', 'total_margin_percent'],
   Boolean: ['rushRequest'],
 };
@@ -1851,6 +2065,7 @@ DC_BULK_DELETE_OP_[SHEET_NAMES.seasonYears + '|showId'] = 'DeleteSeasonYearsBySh
 DC_BULK_DELETE_OP_[SHEET_NAMES.placementMenuItems + '|categoryId'] = 'DeletePlacementMenuItemsByCategoryId';
 DC_BULK_DELETE_OP_[SHEET_NAMES.projectFileLinks + '|projectId'] = 'DeleteProjectFileLinksByProjectId';
 DC_BULK_DELETE_OP_[SHEET_NAMES.versions + '|projectId'] = 'DeleteVersionsByProjectId';
+DC_BULK_DELETE_OP_[SHEET_NAMES.scratchpads + '|projectId'] = 'DeleteScratchpadsByProjectId';
 
 function cascadeForeignKeySql_(sheetName, fields, foreignKeyField, oldValue, newValue) {
   const opName = DC_BULK_UPDATE_OP_[sheetName + '|' + foreignKeyField];
@@ -2976,6 +3191,88 @@ function testValueShapes() {
   return results;
 }
 
+// Investment Approval Scratchpads (2026-11-11): create, edit, the approval
+// round trip, archive/restore, the checks approving enforces, who an email
+// link can go to (nothing is actually sent), the AppSettings round trip,
+// and that deleting a project takes its scratchpads with it.
+function testScratchpads() {
+  const results = [];
+  function check(label, actual, expected) {
+    const pass = JSON.stringify(actual) === JSON.stringify(expected);
+    results.push((pass ? 'PASS' : 'FAIL') + ' -- ' + label + (pass ? '' : (': expected ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual))));
+  }
+  function post(action, payload) {
+    doPost({ parameter: { action: action, payload: JSON.stringify(payload) } });
+  }
+  function threw(fn) {
+    try { fn(); return null; } catch (e) { return e.message; }
+  }
+  function get(id) {
+    return JSON.parse(doGet({ parameter: { action: 'listScratchpads', id: id } }).getContent())[0];
+  }
+
+  const projectId = 'scratchpad-test-project-' + Utilities.getUuid();
+  appendRecordSql_(SHEET_NAMES.projects, PROJECT_FIELDS, { id: projectId, projectName: 'Scratchpad Test Project' });
+
+  const id = Utilities.getUuid();
+  const details = {
+    advertiser: 'Test Advertiser', ip: 'Test IP', totalInvestment: 2000000, evf: 100000,
+    lines: [{ id: 'l1', mediaType: 'Production and Talent', investment: 100000 }],
+  };
+  post('createScratchpad', { id: id, projectId: projectId, name: 'Test Scratchpad', status: 'approved', details: details });
+  let row = get(id);
+  check('Created scratchpad is listed for its project', JSON.parse(doGet({ parameter: { action: 'listScratchpads', projectId: projectId } }).getContent()).map(function (r) { return r.id; }), [id]);
+  check('A new scratchpad always starts as a draft', row.status, 'draft');
+  check('details round-trips as a real object', row.details, details);
+
+  post('setScratchpadStatus', { id: id, status: 'approved' });
+  row = get(id);
+  check('Approve records who approved it', [row.status, row.approvedBy], ['approved', Session.getActiveUser().getEmail()]);
+  check('Approve records when', !!row.approvedAt, true);
+
+  post('updateScratchpad', { id: id, name: 'Test Scratchpad v2' });
+  row = get(id);
+  check('Editing an approved scratchpad sends it back to draft', [row.name, row.status, row.approvedBy, row.approvedAt], ['Test Scratchpad v2', 'draft', null, null]);
+
+  post('setScratchpadStatus', { id: id, status: 'approved' });
+  post('setScratchpadStatus', { id: id, status: 'draft' });
+  row = get(id);
+  check('Remove approval puts it back to draft', [row.status, row.approvedBy], ['draft', null]);
+
+  post('setScratchpadStatus', { id: id, status: 'archived' });
+  check('An archived scratchpad cannot be edited', /archived/.test(threw(function () { post('updateScratchpad', { id: id, name: 'x' }); }) || ''), true);
+  check('An archived scratchpad cannot be approved', /Only a draft/.test(threw(function () { post('setScratchpadStatus', { id: id, status: 'approved' }); }) || ''), true);
+  post('setScratchpadStatus', { id: id, status: 'draft' });
+  check('Restore brings an archived scratchpad back as a draft', get(id).status, 'draft');
+  check('An unknown status is refused', /Unknown scratchpad status/.test(threw(function () { post('setScratchpadStatus', { id: id, status: 'done' }); }) || ''), true);
+
+  check('Approving checks the required fields', scratchpadApprovalProblems_({}), ['Advertiser is required.', 'IP is required.', 'Total investment is required.']);
+  check('Production on a deal under $500K is refused', scratchpadApprovalProblems_({ advertiser: 'a', ip: 'b', totalInvestment: 499999, lines: [{ mediaType: 'Production and Talent', investment: 1 }] }), ['No custom production on deals under $500K.']);
+  check('A deal under $500K with no production is fine', scratchpadApprovalProblems_({ advertiser: 'a', ip: 'b', totalInvestment: 400000, lines: [{ mediaType: 'Paid Media', investment: 400000 }] }), []);
+  check('$500K exactly can have production', scratchpadApprovalProblems_({ advertiser: 'a', ip: 'b', totalInvestment: 500000, lines: [{ mediaType: 'Production and Talent', investment: 100000 }] }), []);
+  const badId = Utilities.getUuid();
+  post('createScratchpad', { id: badId, projectId: projectId, details: { advertiser: 'a', ip: 'b', totalInvestment: 300000, lines: [{ mediaType: 'Production and Talent', investment: 50000 }] } });
+  check('Approve refuses a scratchpad that breaks the $500K floor', /under \$500K/.test(threw(function () { post('setScratchpadStatus', { id: badId, status: 'approved' }); }) || ''), true);
+
+  check('Email recipients are trimmed, lowercased and deduplicated', scratchpadRecipients_(' A@Paramount.com, a@paramount.com;b@paramount.com '), ['a@paramount.com', 'b@paramount.com']);
+  check('Email to an outside address is refused', /Only paramount.com/.test(threw(function () { scratchpadRecipients_('a@paramount.com, someone@gmail.com'); }) || ''), true);
+  check('Email to a look-alike domain is refused', /Only paramount.com/.test(threw(function () { scratchpadRecipients_('a@paramount.com.evil.io'); }) || ''), true);
+  check('Email with no recipients is refused', /at least one/.test(threw(function () { scratchpadRecipients_(' , '); }) || ''), true);
+
+  const before = readRowsSql_(SHEET_NAMES.appSettings).find(function (r) { return r.key === 'scratchpadDefaults'; });
+  post('saveAppSetting', { key: 'scratchpadDefaults', value: { markupPct: 99 } });
+  let setting = JSON.parse(doGet({ parameter: { action: 'listAppSettings' } }).getContent()).find(function (r) { return r.key === 'scratchpadDefaults'; });
+  check('saveAppSetting stores the value as a real object', setting && setting.value, { markupPct: 99 });
+  if (before) post('saveAppSetting', { key: 'scratchpadDefaults', value: before.value });
+  else deleteRowByKeySql_(SHEET_NAMES.appSettings, APP_SETTING_FIELDS, 'key', 'scratchpadDefaults');
+  check('The real defaults are put back after the test', (readRowsSql_(SHEET_NAMES.appSettings).find(function (r) { return r.key === 'scratchpadDefaults'; }) || {}).value || null, before ? before.value : null);
+  check('An unknown setting key is refused', /Unknown setting/.test(threw(function () { post('saveAppSetting', { key: 'other', value: {} }); }) || ''), true);
+
+  post('deleteProject', { id: projectId });
+  check('Deleting the project deletes its scratchpads', readRowsSql_(SHEET_NAMES.scratchpads).filter(function (r) { return r.projectId === projectId; }).length, 0);
+  return results;
+}
+
 function runAllTests() {
   const suites = [
     ['SqlStorageLayer', testSqlStorageLayer],
@@ -2996,6 +3293,7 @@ function runAllTests() {
     ['RecentErrors', testRecentErrors],
     ['UserEmailMatching', testUserEmailMatching],
     ['ValueShapes', testValueShapes],
+    ['Scratchpads', testScratchpads],
   ];
 
   let totalPass = 0, totalFail = 0;

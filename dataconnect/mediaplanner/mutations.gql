@@ -265,3 +265,26 @@ mutation DeleteProjectFileLinksByProjectId($projectId: String) @auth(level: NO_A
 mutation DeleteVersionsByProjectId($projectId: String) @auth(level: NO_ACCESS) {
   version_deleteMany(where: { projectId: { eq: $projectId } })
 }
+
+mutation CreateScratchpad($id: String!, $projectId: String, $name: String, $status: String, $approvedBy: String, $approvedAt: Timestamp, $details: String, $createdAt: Timestamp, $createdBy: String, $updatedAt: Timestamp, $updatedBy: String) @auth(level: NO_ACCESS) {
+  scratchpad_insert(data: { id: $id, projectId: $projectId, name: $name, status: $status, approvedBy: $approvedBy, approvedAt: $approvedAt, details: $details, createdAt: $createdAt, createdBy: $createdBy, updatedAt: $updatedAt, updatedBy: $updatedBy })
+}
+mutation UpdateScratchpad($id: String!, $projectId: String, $name: String, $status: String, $approvedBy: String, $approvedAt: Timestamp, $details: String, $updatedAt: Timestamp, $updatedBy: String) @auth(level: NO_ACCESS) {
+  scratchpad_update(key: { id: $id }, data: { projectId: $projectId, name: $name, status: $status, approvedBy: $approvedBy, approvedAt: $approvedAt, details: $details, updatedAt: $updatedAt, updatedBy: $updatedBy })
+}
+mutation DeleteScratchpad($id: String!) @auth(level: NO_ACCESS) {
+  scratchpad_delete(key: { id: $id })
+}
+mutation DeleteScratchpadsByProjectId($projectId: String) @auth(level: NO_ACCESS) {
+  scratchpad_deleteMany(where: { projectId: { eq: $projectId } })
+}
+
+mutation UpsertAppSetting($key: String!, $value: String, $updatedAt: Timestamp, $updatedBy: String) @auth(level: NO_ACCESS) {
+  appSetting_upsert(data: { key: $key, value: $value, updatedAt: $updatedAt, updatedBy: $updatedBy })
+}
+mutation UpdateAppSetting($key: String!, $value: String, $updatedAt: Timestamp, $updatedBy: String) @auth(level: NO_ACCESS) {
+  appSetting_update(key: { key: $key }, data: { value: $value, updatedAt: $updatedAt, updatedBy: $updatedBy })
+}
+mutation DeleteAppSetting($key: String!) @auth(level: NO_ACCESS) {
+  appSetting_delete(key: { key: $key })
+}

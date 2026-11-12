@@ -192,3 +192,28 @@ query ListClosedDeals @auth(level: NO_ACCESS) {
     updatedAt
   }
 }
+
+query ListScratchpads @auth(level: NO_ACCESS) {
+  scratchpads(limit: 10000) {
+    id
+    projectId
+    name
+    status
+    approvedBy
+    approvedAt
+    details
+    createdAt
+    createdBy
+    updatedAt
+    updatedBy
+  }
+}
+
+query ListAppSettings @auth(level: NO_ACCESS) {
+  appSettings(limit: 10000) {
+    key
+    value
+    updatedAt
+    updatedBy
+  }
+}

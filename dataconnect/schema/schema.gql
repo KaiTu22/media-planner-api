@@ -181,3 +181,33 @@ type ClosedDeal @table(key: "dealId") {
   snapshot: String
   updatedAt: Timestamp @col(name: "updated_at")
 }
+
+# Investment Approval Scratchpad (confirmed 2026-11-11) -- an optional,
+# top-down agreement on how a deal's money splits up, attached to a project
+# (more than one allowed). Replaces Project.scratchpadLink. `details` is
+# the whole worksheet as JSON text (investment lines, talent, production,
+# the rates it was built with), same convention as Version.packages.
+# status: 'draft' | 'approved' | 'archived'.
+type Scratchpad @table {
+  id: String! @col(name: "id")
+  projectId: String
+  name: String
+  status: String
+  approvedBy: String
+  approvedAt: Timestamp
+  details: String
+  createdAt: Timestamp
+  createdBy: String
+  updatedAt: Timestamp
+  updatedBy: String
+}
+
+# App-wide settings that aren't a list of their own, keyed by name. The
+# first one is 'scratchpadDefaults' (rates, SAG types, the partner-type
+# production table). `value` is JSON text.
+type AppSetting @table(key: "key") {
+  key: String!
+  value: String
+  updatedAt: Timestamp
+  updatedBy: String
+}
