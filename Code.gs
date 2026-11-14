@@ -706,6 +706,29 @@ function setScratchpadStatus_(id, status, user, now) {
   updateRecordSql_(SHEET_NAMES.scratchpads, SCRATCHPAD_FIELDS, 'id', id, patch);
 }
 
+// A draft nobody has filled in (2026-11-14). The app offers to discard one
+// when its creator leaves it, so blank drafts don't pile up in projects.
+// Keep in step with isBlankScratchpad in the app's scratchpadMath.js.
+function isBlankScratchpad_(r) {
+  if (!r || r.status !== 'draft') return false;
+  const d = r.details || {};
+  const n = function (v) { return Number(v) || 0; };
+  const s = function (v) { return String(v || '').trim(); };
+  if (s(d.partnerType) || n(d.totalInvestment) || n(d.evf) || s(d.talentNotes) || s(d.productionNotes)) return false;
+  // Media types alone don't count: drafts from before 2026-11-13 started with them filled in.
+  if ((d.lines || []).some(function (l) { return n(l.investment) || s(l.platformStrategy) || s(l.notes); })) return false;
+  // Estimates alone don't count either: Welfare Worker starts at $1,000 with no quantity.
+  if ((d.talent || []).some(function (t) { return s(t.description) || n(t.qty); })) return false;
+  if ((d.production || []).some(function (p) { return n(p.qty); })) return false;
+  return true;
+}
+
+// Only ever deletes an empty draft; anything with work in it is archived instead.
+function deleteBlankScratchpad_(id) {
+  if (!isBlankScratchpad_(findScratchpad_(id))) throw new Error('Only an empty draft can be deleted. Archive it instead.');
+  deleteRowByKeySql_(SHEET_NAMES.scratchpads, SCRATCHPAD_FIELDS, 'id', id);
+}
+
 // Only Paramount addresses: the page itself is DOMAIN-restricted, so a link
 // sent anywhere else wouldn't open, and this keeps the markup in-house.
 function scratchpadRecipients_(to) {
@@ -1147,6 +1170,9 @@ function doPostImpl_(e) {
   } else if (action === 'setScratchpadStatus') {
     requireWrite_(user);
     setScratchpadStatus_(values.id, values.status, user, now);
+  } else if (action === 'deleteBlankScratchpad') {
+    requireWrite_(user);
+    deleteBlankScratchpad_(values.id);
   } else if (action === 'emailScratchpadLink') {
     requireWrite_(user);
     emailScratchpadLink_(values.id, values.to, values.note, user);
@@ -3192,9 +3218,10 @@ function testValueShapes() {
 }
 
 // Investment Approval Scratchpads (2026-11-11): create, edit, the approval
-// round trip, archive/restore, the checks approving enforces, who an email
-// link can go to (nothing is actually sent), the AppSettings round trip,
-// and that deleting a project takes its scratchpads with it.
+// round trip, archive/restore, the checks approving enforces, that only an
+// empty draft can be deleted, who an email link can go to (nothing is
+// actually sent), the AppSettings round trip, and that deleting a project
+// takes its scratchpads with it.
 function testScratchpads() {
   const results = [];
   function check(label, actual, expected) {
@@ -3253,6 +3280,14 @@ function testScratchpads() {
   const badId = Utilities.getUuid();
   post('createScratchpad', { id: badId, projectId: projectId, details: { advertiser: 'a', ip: 'b', totalInvestment: 300000, lines: [{ mediaType: 'Production and Talent', investment: 50000 }] } });
   check('Approve refuses a scratchpad that breaks the $500K floor', /under \$500K/.test(threw(function () { post('setScratchpadStatus', { id: badId, status: 'approved' }); }) || ''), true);
+
+  check('A scratchpad with numbers in it can\'t be deleted', /Only an empty draft/.test(threw(function () { post('deleteBlankScratchpad', { id: badId }); }) || ''), true);
+  check('...and is still there', !!get(badId), true);
+  const blankId = Utilities.getUuid();
+  post('createScratchpad', { id: blankId, projectId: projectId, details: { advertiser: 'a', ip: 'b', partnerType: '', totalInvestment: null,
+    lines: [{ id: 'b1', mediaType: 'Paid Media', investment: null }], production: [{ id: 'p1', label: 'Glam', estCost: 1000, qty: null }] } });
+  post('deleteBlankScratchpad', { id: blankId });
+  check('An empty draft can be deleted', !!get(blankId), false);
 
   check('Email recipients are trimmed, lowercased and deduplicated', scratchpadRecipients_(' A@Paramount.com, a@paramount.com;b@paramount.com '), ['a@paramount.com', 'b@paramount.com']);
   check('Email to an outside address is refused', /Only paramount.com/.test(threw(function () { scratchpadRecipients_('a@paramount.com, someone@gmail.com'); }) || ''), true);
